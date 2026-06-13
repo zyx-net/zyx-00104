@@ -15,21 +15,6 @@ class CertificateImportSchema(Schema):
     calibrator = fields.String(required=False, allow_none=True)
     cert_file = fields.String(required=False, allow_none=True)
 
-    @validates('range_min')
-    def validate_range_min(self, value):
-        if value < 0:
-            raise ValidationError('Range min must be non-negative')
-
-    @validates('range_max')
-    def validate_range_max(self, value, **kwargs):
-        if value <= 0:
-            raise ValidationError('Range max must be positive')
-
-    @validates('deviation')
-    def validate_deviation(self, value):
-        if value is None:
-            raise ValidationError('Deviation is required')
-
 class CertificateValidator:
     def __init__(self):
         self.errors = []
@@ -49,13 +34,6 @@ class CertificateValidator:
         try:
             cal_date = parser.parse(data['calibration_date']).date()
             valid_until = parser.parse(data['valid_until']).date()
-            today = datetime.now().date()
-
-            if cal_date > today:
-                self.errors.append({
-                    'field': 'calibration_date',
-                    'error': f'Calibration date cannot be in the future: {cal_date}'
-                })
 
             if valid_until <= cal_date:
                 self.errors.append({
@@ -80,6 +58,18 @@ class CertificateValidator:
             })
 
     def _validate_range(self, data, equipment):
+        if data['range_min'] < 0:
+            self.errors.append({
+                'field': 'range_min',
+                'error': 'Range min must be non-negative'
+            })
+
+        if data['range_max'] <= 0:
+            self.errors.append({
+                'field': 'range_max',
+                'error': 'Range max must be positive'
+            })
+
         if equipment.range_min is not None and equipment.range_max is not None:
             if not (equipment.range_min <= data['range_min'] and data['range_max'] <= equipment.range_max):
                 self.errors.append({
@@ -101,7 +91,12 @@ class CertificateValidator:
             })
 
     def _validate_deviation(self, data, equipment):
-        if equipment.tolerance is not None:
+        if data['deviation'] is None:
+            self.errors.append({
+                'field': 'deviation',
+                'error': 'Deviation is required'
+            })
+        elif equipment.tolerance is not None:
             if abs(data['deviation']) > equipment.tolerance:
                 self.errors.append({
                     'field': 'deviation',

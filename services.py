@@ -1,5 +1,5 @@
 from models import db, Certificate, Equipment, AuditLog, WorkflowStatus
-from validators import CertificateValidator, parse_csv_to_json
+from validators import CertificateValidator, CertificateImportSchema, parse_csv_to_json
 from marshmallow import ValidationError
 from datetime import datetime
 import json
@@ -111,6 +111,11 @@ class CertificateImportService:
             db.session.add(cert)
             db.session.flush()
 
+            details_for_audit = {
+                k: v.isoformat() if hasattr(v, 'isoformat') else v
+                for k, v in validated_data.items()
+            }
+
             audit = AuditLog(
                 operator=operator,
                 action='import',
@@ -118,7 +123,7 @@ class CertificateImportService:
                 resource_id=cert.id,
                 certificate_id=cert.id,
                 batch_id=batch_id,
-                details=json.dumps(validated_data),
+                details=json.dumps(details_for_audit),
                 notes=f'Certificate imported by {operator}',
                 decision_basis='Initial import',
                 version=1,

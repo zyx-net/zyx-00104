@@ -213,7 +213,7 @@ def release_certificate(certificate_id):
         cert = Certificate.query.get(certificate_id)
         return jsonify(cert.to_dict())
     else:
-        return jsonify({'errors': errors, 'message': 'Release failed'}, 400)
+        return jsonify({'errors': errors, 'message': 'Release failed'}), 400
 
 @app.route('/api/certificates/<int:certificate_id>/limit', methods=['POST'])
 def limit_certificate(certificate_id):
