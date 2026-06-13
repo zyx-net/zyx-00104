@@ -544,3 +544,117 @@ def setup_certificate_for_workflow(client):
     )
     import_data = json.loads(import_response.data)
     return import_data['imported'][0]
+
+def test_create_equipment_array(client):
+    """测试数组格式创建设备"""
+    response = client.post('/api/equipment',
+        data=json.dumps([
+            {
+                'equipment_no': f'EQ-ARRAY-{int(time.time())}-1',
+                'equipment_name': 'Test Multimeter',
+                'model_spec': 'FLUKE 87V',
+                'manufacturer': 'Fluke',
+                'range_min': 0,
+                'range_max': 1000,
+                'unit': 'V',
+                'tolerance': 0.05,
+                'location': 'Lab 1'
+            },
+            {
+                'equipment_no': f'EQ-ARRAY-{int(time.time())}-2',
+                'equipment_name': 'Test Pressure Gauge',
+                'model_spec': 'WIKA S-10',
+                'manufacturer': 'WIKA',
+                'range_min': 0,
+                'range_max': 10,
+                'unit': 'MPa',
+                'tolerance': 0.002,
+                'location': 'Lab 2'
+            }
+        ]),
+        content_type='application/json'
+    )
+    assert response.status_code == 201
+    data = json.loads(response.data)
+    assert isinstance(data, list)
+    assert len(data) == 2
+    assert data[0]['equipment_name'] == 'Test Multimeter'
+    assert data[1]['equipment_name'] == 'Test Pressure Gauge'
+
+def test_export_equipment_csv(client, sample_equipment):
+    """测试按设备ID导出CSV"""
+    client.post('/api/certificates/import',
+        data=json.dumps({
+            'operator': 'Test Operator',
+            'data': [{
+                'cert_no': f'CERT-EXPORT-CSV-{int(time.time())}',
+                'equipment_no': 'EQ-TEST-001',
+                'calibration_date': '2026-01-01',
+                'valid_until': '2027-01-01',
+                'range_min': 0,
+                'range_max': 100,
+                'unit': 'V',
+                'deviation': 0.02
+            }]
+        }),
+        content_type='application/json'
+    )
+
+    cert_response = client.get('/api/certificates')
+    certs = json.loads(cert_response.data)
+    cert_id = certs[0]['id']
+
+    client.post(f'/api/certificates/{cert_id}/enter',
+        data=json.dumps({'operator': 'Operator1'}),
+        content_type='application/json'
+    )
+
+    client.post(f'/api/certificates/{cert_id}/review',
+        data=json.dumps({'operator': 'Metrologist1', 'decision_basis': 'OK'}),
+        content_type='application/json'
+    )
+
+    client.post(f'/api/certificates/{cert_id}/approve',
+        data=json.dumps({'operator': 'Supervisor1', 'decision_basis': 'OK'}),
+        content_type='application/json'
+    )
+
+    client.post(f'/api/certificates/{cert_id}/release',
+        data=json.dumps({'operator': 'Operator2', 'decision_basis': 'OK'}),
+        content_type='application/json'
+    )
+
+    export_response = client.get(f'/api/export/equipment/{sample_equipment}?format=csv')
+    assert export_response.status_code == 200
+    assert 'text/csv' in export_response.content_type
+    csv_content = export_response.data.decode('utf-8')
+    assert 'cert_no' in csv_content
+    assert 'equipment_no' in csv_content
+    lines = csv_content.strip().split('\n')
+    assert len(lines) >= 2
+
+def test_export_equipment_json(client, sample_equipment):
+    """测试按设备ID导出JSON"""
+    client.post('/api/certificates/import',
+        data=json.dumps({
+            'operator': 'Test Operator',
+            'data': [{
+                'cert_no': f'CERT-EXPORT-JSON-{int(time.time())}',
+                'equipment_no': 'EQ-TEST-001',
+                'calibration_date': '2026-01-01',
+                'valid_until': '2027-01-01',
+                'range_min': 0,
+                'range_max': 100,
+                'unit': 'V',
+                'deviation': 0.02
+            }]
+        }),
+        content_type='application/json'
+    )
+
+    export_response = client.get(f'/api/export/equipment/{sample_equipment}?format=json')
+    assert export_response.status_code == 200
+    data = json.loads(export_response.data)
+    assert isinstance(data, list)
+    assert len(data) >= 1
+    assert data[0]['equipment_no'] == 'EQ-TEST-001'

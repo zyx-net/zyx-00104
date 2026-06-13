@@ -5,6 +5,7 @@ from services import CertificateImportService, WorkflowService, ExportService
 from validators import parse_csv_to_json
 import os
 import json
+import io
 
 app = Flask(__name__)
 CORS(app)
@@ -39,34 +40,68 @@ def get_equipment(equipment_id):
 @app.route('/api/equipment', methods=['POST'])
 def create_equipment():
     data = request.json
-    equipment = Equipment(
-        equipment_no=data['equipment_no'],
-        equipment_name=data['equipment_name'],
-        model_spec=data.get('model_spec'),
-        manufacturer=data.get('manufacturer'),
-        range_min=data.get('range_min'),
-        range_max=data.get('range_max'),
-        unit=data.get('unit'),
-        tolerance=data.get('tolerance'),
-        location=data.get('location')
-    )
-    db.session.add(equipment)
-    db.session.commit()
 
-    audit = AuditLog(
-        operator=data.get('operator', 'system'),
-        action='create',
-        resource_type='equipment',
-        resource_id=equipment.id,
-        equipment_id=equipment.id,
-        notes='Equipment created',
-        version=1,
-        new_state='active'
-    )
-    db.session.add(audit)
-    db.session.commit()
+    if isinstance(data, list):
+        results = []
+        for eq_data in data:
+            equipment = Equipment(
+                equipment_no=eq_data['equipment_no'],
+                equipment_name=eq_data['equipment_name'],
+                model_spec=eq_data.get('model_spec'),
+                manufacturer=eq_data.get('manufacturer'),
+                range_min=eq_data.get('range_min'),
+                range_max=eq_data.get('range_max'),
+                unit=eq_data.get('unit'),
+                tolerance=eq_data.get('tolerance'),
+                location=eq_data.get('location')
+            )
+            db.session.add(equipment)
+            db.session.flush()
 
-    return jsonify(equipment.to_dict()), 201
+            audit = AuditLog(
+                operator=eq_data.get('operator', 'system'),
+                action='create',
+                resource_type='equipment',
+                resource_id=equipment.id,
+                equipment_id=equipment.id,
+                notes='Equipment created',
+                version=1,
+                new_state='active'
+            )
+            db.session.add(audit)
+            results.append(equipment.to_dict())
+
+        db.session.commit()
+        return jsonify(results), 201
+    else:
+        equipment = Equipment(
+            equipment_no=data['equipment_no'],
+            equipment_name=data['equipment_name'],
+            model_spec=data.get('model_spec'),
+            manufacturer=data.get('manufacturer'),
+            range_min=data.get('range_min'),
+            range_max=data.get('range_max'),
+            unit=data.get('unit'),
+            tolerance=data.get('tolerance'),
+            location=data.get('location')
+        )
+        db.session.add(equipment)
+        db.session.commit()
+
+        audit = AuditLog(
+            operator=data.get('operator', 'system'),
+            action='create',
+            resource_type='equipment',
+            resource_id=equipment.id,
+            equipment_id=equipment.id,
+            notes='Equipment created',
+            version=1,
+            new_state='active'
+        )
+        db.session.add(audit)
+        db.session.commit()
+
+        return jsonify(equipment.to_dict()), 201
 
 @app.route('/api/certificates/import', methods=['POST'])
 def import_certificates():
