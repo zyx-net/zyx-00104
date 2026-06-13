@@ -1,0 +1,294 @@
+from models import db, Certificate, Equipment, AuditLog, WorkflowStatus
+from validators import CertificateValidator, parse_csv_to_json
+from marshmallow import ValidationError
+from datetime import datetime
+import json
+import uuid
+
+class CertificateImportService:
+    def __init__(self):
+        self.validator = CertificateValidator()
+
+    def import_certificates(self, data_list, operator, batch_id=None):
+        if not batch_id:
+            batch_id = str(uuid.uuid4())
+
+        results = {
+            'batch_id': batch_id,
+            'total': len(data_list),
+            'successful': 0,
+            'failed': 0,
+            'errors': [],
+            'imported': []
+        }
+
+        imported_ids = []
+
+        try:
+            for idx, data in enumerate(data_list):
+                result = self._import_single_certificate(data, operator, batch_id)
+                if result['success']:
+                    results['successful'] += 1
+                    imported_ids.append(result['certificate_id'])
+                    results['imported'].append(result['certificate_id'])
+                else:
+                    results['failed'] += 1
+                    results['errors'].append({
+                        'index': idx,
+                        'cert_no': data.get('cert_no'),
+                        'errors': result['errors']
+                    })
+
+            if results['failed'] > 0:
+                for cert_id in imported_ids:
+                    cert = Certificate.query.get(cert_id)
+                    if cert:
+                        db.session.delete(cert)
+                db.session.commit()
+                results['imported'] = []
+                results['successful'] = 0
+                return results, False
+
+            db.session.commit()
+            return results, True
+
+        except Exception as e:
+            db.session.rollback()
+            for cert_id in imported_ids:
+                cert = Certificate.query.get(cert_id)
+                if cert:
+                    db.session.delete(cert)
+            db.session.commit()
+
+            results['errors'].append({
+                'index': -1,
+                'error': f'Batch import failed: {str(e)}'
+            })
+            return results, False
+
+    def _import_single_certificate(self, data, operator, batch_id):
+        try:
+            schema = CertificateImportSchema()
+            validated_data = schema.load(data)
+
+            equipment = Equipment.query.filter_by(equipment_no=validated_data['equipment_no']).first()
+            if not equipment:
+                return {
+                    'success': False,
+                    'errors': [{'field': 'equipment_no', 'error': f'Equipment {validated_data["equipment_no"]} not found'}]
+                }
+
+            is_valid, errors = self.validator.validate_certificate_data(validated_data, equipment)
+            if not is_valid:
+                return {
+                    'success': False,
+                    'errors': errors
+                }
+
+            existing_cert = Certificate.query.filter_by(cert_no=validated_data['cert_no']).first()
+            if existing_cert:
+                return {
+                    'success': False,
+                    'errors': [{'field': 'cert_no', 'error': f'Certificate {validated_data["cert_no"]} already exists'}]
+                }
+
+            cert = Certificate(
+                cert_no=validated_data['cert_no'],
+                batch_id=batch_id,
+                equipment_id=equipment.id,
+                calibration_date=validated_data['_parsed_cal_date'],
+                valid_until=validated_data['_parsed_valid_until'],
+                range_min=validated_data['range_min'],
+                range_max=validated_data['range_max'],
+                unit=validated_data['unit'],
+                deviation=validated_data['deviation'],
+                calibrator=validated_data.get('calibrator'),
+                cert_file=validated_data.get('cert_file'),
+                workflow_status=WorkflowStatus.DRAFT.value,
+                version=1
+            )
+
+            db.session.add(cert)
+            db.session.flush()
+
+            audit = AuditLog(
+                operator=operator,
+                action='import',
+                resource_type='certificate',
+                resource_id=cert.id,
+                certificate_id=cert.id,
+                batch_id=batch_id,
+                details=json.dumps(validated_data),
+                notes=f'Certificate imported by {operator}',
+                decision_basis='Initial import',
+                version=1,
+                new_state=WorkflowStatus.DRAFT.value
+            )
+            db.session.add(audit)
+
+            return {
+                'success': True,
+                'certificate_id': cert.id
+            }
+
+        except ValidationError as e:
+            return {
+                'success': False,
+                'errors': [{'field': k, 'error': str(v)} for k, v in e.messages.items()]
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'errors': [{'field': 'system', 'error': str(e)}]
+            }
+
+class WorkflowService:
+    def __init__(self):
+        self.errors = []
+
+    def enter(self, certificate_id, operator, notes=''):
+        return self._transition(certificate_id, operator, WorkflowStatus.ENTERED, 'enter', notes)
+
+    def review(self, certificate_id, operator, notes='', decision_basis=''):
+        return self._transition(certificate_id, operator, WorkflowStatus.REVIEWED, 'review', notes, decision_basis)
+
+    def approve(self, certificate_id, operator, notes='', decision_basis=''):
+        return self._transition(certificate_id, operator, WorkflowStatus.APPROVED, 'approve', notes, decision_basis)
+
+    def release(self, certificate_id, operator, notes='', decision_basis=''):
+        cert = Certificate.query.get(certificate_id)
+        if not cert:
+            return False, [{'error': 'Certificate not found'}]
+
+        if operator == cert.entered_by:
+            return False, [{'error': 'Operator cannot release their own entry', 'field': 'operator'}]
+
+        return self._transition(certificate_id, operator, WorkflowStatus.RELEASED, 'release', notes, decision_basis)
+
+    def limit(self, certificate_id, operator, notes='', decision_basis=''):
+        return self._transition(certificate_id, operator, WorkflowStatus.LIMITED, 'limit', notes, decision_basis)
+
+    def stop(self, certificate_id, operator, notes='', decision_basis=''):
+        return self._transition(certificate_id, operator, WorkflowStatus.STOPPED, 'stop', notes, decision_basis)
+
+    def _transition(self, certificate_id, operator, new_status, action, notes='', decision_basis=''):
+        self.errors = []
+        cert = Certificate.query.get(certificate_id)
+
+        if not cert:
+            self.errors.append({'error': 'Certificate not found'})
+            return False, self.errors
+
+        previous_status = cert.workflow_status
+        previous_equipment_status = cert.equipment.status
+
+        valid_transitions = {
+            WorkflowStatus.DRAFT.value: [WorkflowStatus.ENTERED.value],
+            WorkflowStatus.ENTERED.value: [WorkflowStatus.REVIEWED.value],
+            WorkflowStatus.REVIEWED.value: [WorkflowStatus.APPROVED.value],
+            WorkflowStatus.APPROVED.value: [WorkflowStatus.RELEASED.value, WorkflowStatus.LIMITED.value, WorkflowStatus.STOPPED.value]
+        }
+
+        if new_status.value not in valid_transitions.get(previous_status, []):
+            self.errors.append({
+                'error': f'Invalid transition from {previous_status} to {new_status.value}',
+                'field': 'workflow_status'
+            })
+            return False, self.errors
+
+        cert.workflow_status = new_status.value
+        cert.version += 1
+        cert.updated_at = datetime.utcnow()
+
+        if new_status == WorkflowStatus.ENTERED:
+            cert.entered_by = operator
+            cert.entered_at = datetime.utcnow()
+        elif new_status == WorkflowStatus.REVIEWED:
+            cert.reviewed_by = operator
+            cert.reviewed_at = datetime.utcnow()
+        elif new_status == WorkflowStatus.APPROVED:
+            cert.approved_by = operator
+            cert.approved_at = datetime.utcnow()
+        elif new_status == WorkflowStatus.RELEASED:
+            cert.released_by = operator
+            cert.released_at = datetime.utcnow()
+            cert.equipment.status = 'active'
+        elif new_status == WorkflowStatus.LIMITED:
+            cert.released_by = operator
+            cert.released_at = datetime.utcnow()
+            cert.equipment.status = 'limited'
+        elif new_status == WorkflowStatus.STOPPED:
+            cert.released_by = operator
+            cert.released_at = datetime.utcnow()
+            cert.equipment.status = 'stopped'
+
+        audit = AuditLog(
+            operator=operator,
+            action=action,
+            resource_type='certificate',
+            resource_id=cert.id,
+            certificate_id=cert.id,
+            batch_id=cert.batch_id,
+            notes=notes,
+            decision_basis=decision_basis,
+            version=cert.version,
+            previous_state=previous_status,
+            new_state=new_status.value
+        )
+        db.session.add(audit)
+
+        if new_status in [WorkflowStatus.RELEASED, WorkflowStatus.LIMITED, WorkflowStatus.STOPPED]:
+            equipment_audit = AuditLog(
+                operator=operator,
+                action=f'equipment_{action}',
+                resource_type='equipment',
+                resource_id=cert.equipment.id,
+                equipment_id=cert.equipment.id,
+                certificate_id=cert.id,
+                batch_id=cert.batch_id,
+                notes=notes,
+                decision_basis=decision_basis,
+                version=cert.equipment.status,
+                previous_state=previous_equipment_status,
+                new_state=cert.equipment.status
+            )
+            db.session.add(equipment_audit)
+
+        try:
+            db.session.commit()
+            return True, []
+        except Exception as e:
+            db.session.rollback()
+            self.errors.append({'error': str(e)})
+            return False, self.errors
+
+class ExportService:
+    def export_by_equipment(self, equipment_id, format='json'):
+        certs = Certificate.query.filter_by(equipment_id=equipment_id).all()
+        return self._format_output(certs, format)
+
+    def export_by_batch(self, batch_id, format='json'):
+        certs = Certificate.query.filter_by(batch_id=batch_id).all()
+        return self._format_output(certs, format)
+
+    def export_all(self, format='json'):
+        certs = Certificate.query.all()
+        return self._format_output(certs, format)
+
+    def _format_output(self, certs, format):
+        if format == 'json':
+            return json.dumps([cert.to_dict() for cert in certs], indent=2, ensure_ascii=False)
+        elif format == 'csv':
+            import csv
+            import io
+            output = io.StringIO()
+            if not certs:
+                return ''
+
+            fieldnames = list(certs[0].to_dict().keys())
+            writer = csv.DictWriter(output, fieldnames=fieldnames)
+            writer.writeheader()
+            for cert in certs:
+                writer.writerow(cert.to_dict())
+            return output.getvalue()
+        return ''

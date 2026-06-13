@@ -1,0 +1,62 @@
+[
+  {
+    "equipment_no": "EQ-2024-001",
+    "equipment_name": "Digital Multimeter",
+    "model_spec": "FLUKE 87V",
+    "manufacturer": "Fluke Corporation",
+    "range_min": 0,
+    "range_max": 1000,
+    "unit": "V",
+    "tolerance": 0.05,
+    "location": "Lab A - Station 1",
+    "operator": "system"
+  },
+  {
+    "equipment_no": "EQ-2024-002",
+    "equipment_name": "Pressure Gauge",
+    "model_spec": "WIKA S-10",
+    "manufacturer": "WIKA Alexander Wiegand SE",
+    "range_min": 0,
+    "range_max": 10,
+    "unit": "MPa",
+    "tolerance": 0.002,
+    "location": "Lab B - Station 2",
+    "operator": "system"
+  },
+  {
+    "equipment_no": "EQ-2024-003",
+    "equipment_name": "Thermometer",
+    "model_spec": "Fluke 1524",
+    "manufacturer": "Fluke Corporation",
+    "range_min": -40,
+    "range_max": 150,
+    "unit": "°C",
+    "tolerance": 0.1,
+    "location": "Lab C - Station 3",
+    "operator": "system"
+  },
+  {
+    "equipment_no": "EQ-2024-004",
+    "equipment_name": "Scale",
+    "model_spec": "Mettler Toledo XPR",
+    "manufacturer": "Mettler Toledo",
+    "range_min": 0,
+    "range_max": 500,
+    "unit": "g",
+    "tolerance": 0.001,
+    "location": "Lab D - Station 4",
+    "operator": "system"
+  },
+  {
+    "equipment_no": "EQ-2024-005",
+    "equipment_name": "Oscilloscope",
+    "model_spec": "Tektronix MSO54",
+    "manufacturer": "Tektronix",
+    "range_min": 0,
+    "range_max": 500,
+    "unit": "MHz",
+    "tolerance": 0.01,
+    "location": "Lab E - Station 5",
+    "operator": "system"
+  }
+]
