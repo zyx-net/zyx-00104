@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from models import db, Equipment, Certificate, AuditLog, WorkflowStatus, Report, ReportStatus, CalibrationTask, TaskStatus, TaskType
-from services import CertificateImportService, WorkflowService, ExportService, ExpiryWarningService, BatchStatsService, ConfigService, BatchWorkflowService, RevertService, ExpiryAutoTransitionService, CertificateSearchService, RolePermissionService, UserService, PermissionDeniedException, ExpiryCheckConflictException, ScheduledTaskService, ReportService, ReportGenerationConflictException, CertificateLockedException, CalibrationTaskService, TaskConflictException, CalibrationStatisticsService, StatisticsPermissionDeniedException
+from services import CertificateImportService, WorkflowService, ExportService, ExpiryWarningService, BatchStatsService, ConfigService, BatchWorkflowService, RevertService, ExpiryAutoTransitionService, CertificateSearchService, RolePermissionService, UserService, PermissionDeniedException, ExpiryCheckConflictException, ScheduledTaskService, ReportService, ReportGenerationConflictException, CertificateLockedException, CalibrationTaskService, TaskConflictException, CalibrationStatisticsService, StatisticsPermissionDeniedException, AuditService, AuditQueryPermissionDeniedException
 from validators import parse_csv_to_json
 from datetime import datetime
 import os
@@ -610,6 +610,157 @@ def list_audit_logs():
 
     logs = query.order_by(AuditLog.timestamp.desc()).all()
     return jsonify([log.to_dict() for log in logs])
+
+
+@app.route('/api/audit/search', methods=['GET'])
+def search_audit_logs():
+    operator = request.args.get('operator')
+    start_time = request.args.get('start_time')
+    end_time = request.args.get('end_time')
+    action = request.args.get('action')
+    resource_type = request.args.get('resource_type')
+    certificate_id = request.args.get('certificate_id', type=int)
+    equipment_id = request.args.get('equipment_id', type=int)
+    batch_id = request.args.get('batch_id')
+    target_operator = request.args.get('target_operator')
+    
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 20, type=int)
+
+    if not operator:
+        return jsonify({'error': 'Operator is required'}), 400
+
+    if page < 1:
+        page = 1
+    if per_page < 1 or per_page > 100:
+        per_page = 20
+
+    filters = {}
+    if start_time:
+        filters['start_time'] = start_time
+    if end_time:
+        filters['end_time'] = end_time
+    if action:
+        filters['action'] = action
+    if target_operator:
+        filters['target_operator'] = target_operator
+    if resource_type:
+        filters['resource_type'] = resource_type
+    if certificate_id:
+        filters['certificate_id'] = certificate_id
+    if equipment_id:
+        filters['equipment_id'] = equipment_id
+    if batch_id:
+        filters['batch_id'] = batch_id
+
+    audit_service = AuditService()
+
+    try:
+        results = audit_service.query_audit_logs(
+            operator=operator,
+            filters=filters if filters else None,
+            page=page,
+            per_page=per_page
+        )
+        return jsonify(results)
+    except AuditQueryPermissionDeniedException as e:
+        return jsonify({
+            'error': e.message,
+            'required_role': e.required_role,
+            'operator_role': e.operator_role
+        }), 403
+
+
+@app.route('/api/audit/export', methods=['GET'])
+def export_audit_logs():
+    operator = request.args.get('operator')
+    start_time = request.args.get('start_time')
+    end_time = request.args.get('end_time')
+    action = request.args.get('action')
+    resource_type = request.args.get('resource_type')
+    certificate_id = request.args.get('certificate_id', type=int)
+    equipment_id = request.args.get('equipment_id', type=int)
+    batch_id = request.args.get('batch_id')
+    target_operator = request.args.get('target_operator')
+
+    if not operator:
+        return jsonify({'error': 'Operator is required'}), 400
+
+    filters = {}
+    if start_time:
+        filters['start_time'] = start_time
+    if end_time:
+        filters['end_time'] = end_time
+    if action:
+        filters['action'] = action
+    if target_operator:
+        filters['target_operator'] = target_operator
+    if resource_type:
+        filters['resource_type'] = resource_type
+    if certificate_id:
+        filters['certificate_id'] = certificate_id
+    if equipment_id:
+        filters['equipment_id'] = equipment_id
+    if batch_id:
+        filters['batch_id'] = batch_id
+
+    audit_service = AuditService()
+
+    try:
+        csv_content = audit_service.export_audit_logs_csv(
+            operator=operator,
+            filters=filters if filters else None
+        )
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f'audit_logs_{timestamp}.csv'
+
+        return send_file(
+            io.BytesIO(csv_content.encode('utf-8-sig')),
+            mimetype='text/csv',
+            as_attachment=True,
+            download_name=filename
+        )
+    except AuditQueryPermissionDeniedException as e:
+        return jsonify({
+            'error': e.message,
+            'required_role': e.required_role,
+            'operator_role': e.operator_role
+        }), 403
+
+
+@app.route('/api/audit/archive', methods=['POST'])
+def archive_audit_logs():
+    data = request.json
+    operator = data.get('operator')
+
+    if not operator:
+        return jsonify({'error': 'Operator is required'}), 400
+
+    role = RolePermissionService.get_user_role(operator)
+    if role != 'supervisor':
+        return jsonify({
+            'error': 'Archive operation requires supervisor role',
+            'required_role': ['supervisor'],
+            'operator_role': role
+        }), 403
+
+    audit_service = AuditService()
+    result = audit_service.archive_old_logs()
+
+    if result['success']:
+        return jsonify(result)
+    else:
+        return jsonify(result), 400
+
+
+@app.errorhandler(AuditQueryPermissionDeniedException)
+def handle_audit_permission_denied(e):
+    return jsonify({
+        'error': e.message,
+        'required_role': e.required_role,
+        'operator_role': e.operator_role
+    }), 403
 
 @app.route('/api/reports/preview/<int:certificate_id>', methods=['POST'])
 def preview_report(certificate_id):

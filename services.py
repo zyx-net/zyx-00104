@@ -1,7 +1,7 @@
-from models import db, Certificate, Equipment, AuditLog, WorkflowStatus, User, UserRole, Report, ReportStatus, CalibrationTask, TaskStatus, TaskType
+from models import db, Certificate, Equipment, AuditLog, AuditArchive, WorkflowStatus, User, UserRole, Report, ReportStatus, CalibrationTask, TaskStatus, TaskType
 from validators import CertificateValidator, CertificateImportSchema, parse_csv_to_json
 from marshmallow import ValidationError
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from sqlalchemy import func
 import json
 import uuid
@@ -150,9 +150,9 @@ class ConfigService:
                     self._config = json.load(f)
                 self._config_mtime = os.path.getmtime(CONFIG_FILE)
             except Exception as e:
-                pass
+                self._config = {'expiry_warning_days': 30, 'expiry_check_interval_hours': 24, 'audit': {'retention_days': 90, 'export_max_rows': 10000, 'auto_reload': True, 'reload_interval_seconds': 5, 'archive_time_hour': 3}}
         else:
-            self._config = {'expiry_warning_days': 30, 'expiry_check_interval_hours': 24}
+            self._config = {'expiry_warning_days': 30, 'expiry_check_interval_hours': 24, 'audit': {'retention_days': 90, 'export_max_rows': 10000, 'auto_reload': True, 'reload_interval_seconds': 5, 'archive_time_hour': 3}}
             self._save_config()
 
     def _save_config(self):
@@ -1106,6 +1106,7 @@ class ExportService:
 class ScheduledTaskService:
     _scheduler_thread = None
     _stop_event = None
+    _last_archive_date = None
 
     @classmethod
     def start_scheduler(cls, app):
@@ -1134,29 +1135,49 @@ class ScheduledTaskService:
         while not stop_event.is_set():
             with app.app_context():
                 try:
-                    config_service = ConfigService()
-                    interval_hours = config_service.get_expiry_check_interval_hours()
-                    last_check = config_service.get_last_expiry_check_time()
-
-                    should_run = True
-                    if last_check:
-                        try:
-                            last_time = datetime.fromisoformat(last_check)
-                            hours_since_last = (datetime.utcnow() - last_time).total_seconds() / 3600
-                            should_run = hours_since_last >= interval_hours
-                        except:
-                            pass
-
-                    if should_run:
-                        expiry_service = ExpiryAutoTransitionService()
-                        try:
-                            expiry_service.process_expired_certificates(source='scheduled')
-                        except ExpiryCheckConflictException:
-                            pass
+                    cls._process_expiry_check()
+                    cls._process_audit_archive()
                 except Exception as e:
                     pass
 
             time.sleep(60)
+
+    @classmethod
+    def _process_expiry_check(cls):
+        config_service = ConfigService()
+        interval_hours = config_service.get_expiry_check_interval_hours()
+        last_check = config_service.get_last_expiry_check_time()
+
+        should_run = True
+        if last_check:
+            try:
+                last_time = datetime.fromisoformat(last_check)
+                hours_since_last = (datetime.utcnow() - last_time).total_seconds() / 3600
+                should_run = hours_since_last >= interval_hours
+            except:
+                pass
+
+        if should_run:
+            expiry_service = ExpiryAutoTransitionService()
+            try:
+                expiry_service.process_expired_certificates(source='scheduled')
+            except ExpiryCheckConflictException:
+                pass
+
+    @classmethod
+    def _process_audit_archive(cls):
+        now = datetime.utcnow()
+        archive_hour = ConfigService()._get_config().get('audit', {}).get('archive_time_hour', 3)
+        
+        today = now.date()
+        
+        if cls._last_archive_date == today:
+            return
+
+        if now.hour == archive_hour:
+            audit_service = AuditService()
+            audit_service.archive_old_logs()
+            cls._last_archive_date = today
 
     @classmethod
     def get_scheduler_status(cls):
@@ -1164,7 +1185,8 @@ class ScheduledTaskService:
             'running': cls._scheduler_thread is not None and cls._scheduler_thread.is_alive(),
             'last_check_time': ConfigService().get_last_expiry_check_time(),
             'check_interval_hours': ConfigService().get_expiry_check_interval_hours(),
-            'check_in_progress': ConfigService().get_expiry_check_in_progress()
+            'check_in_progress': ConfigService().get_expiry_check_in_progress(),
+            'last_archive_date': cls._last_archive_date.isoformat() if cls._last_archive_date else None
         }
 
 
@@ -2325,3 +2347,339 @@ class CalibrationStatisticsService:
         db.session.commit()
         
         return csv_content
+
+
+class AuditQueryPermissionDeniedException(Exception):
+    def __init__(self, message, required_role, operator_role):
+        self.message = message
+        self.required_role = required_role
+        self.operator_role = operator_role
+        super().__init__(self.message)
+
+
+class AuditService:
+    REQUIRED_ROLES_FOR_QUERY = [UserRole.SUPERVISOR.value, UserRole.METROLOGIST.value]
+    REQUIRED_ROLE_FOR_EXPORT = UserRole.SUPERVISOR.value
+
+    def __init__(self):
+        self._config_service = ConfigService()
+
+    def _get_audit_config(self):
+        config = self._config_service.get_config()
+        return config.get('audit', {
+            'retention_days': 90,
+            'export_max_rows': 10000,
+            'auto_reload': True,
+            'reload_interval_seconds': 5,
+            'archive_time_hour': 3
+        })
+
+    def _get_retention_days(self):
+        return self._get_audit_config().get('retention_days', 90)
+
+    def _get_export_max_rows(self):
+        return self._get_audit_config().get('export_max_rows', 10000)
+
+    def check_query_permission(self, operator):
+        role = RolePermissionService.get_user_role(operator)
+        if role not in self.REQUIRED_ROLES_FOR_QUERY:
+            denied_reason = f"Audit query requires metrologist or supervisor role, but user has: {role}"
+            audit = AuditLog(
+                operator=operator,
+                action='permission_denied',
+                resource_type='audit',
+                notes=denied_reason,
+                denied_reason=denied_reason
+            )
+            db.session.add(audit)
+            db.session.commit()
+            raise AuditQueryPermissionDeniedException(
+                message=denied_reason,
+                required_role=['metrologist', 'supervisor'],
+                operator_role=role
+            )
+        return role
+
+    def check_export_permission(self, operator):
+        role = RolePermissionService.get_user_role(operator)
+        if role != self.REQUIRED_ROLE_FOR_EXPORT:
+            denied_reason = f"Audit export requires supervisor role, but user has: {role}"
+            audit = AuditLog(
+                operator=operator,
+                action='permission_denied',
+                resource_type='audit',
+                notes=denied_reason,
+                denied_reason=denied_reason
+            )
+            db.session.add(audit)
+            db.session.commit()
+            raise AuditQueryPermissionDeniedException(
+                message=denied_reason,
+                required_role=['supervisor'],
+                operator_role=role
+            )
+        return role
+
+    def _build_query(self, filters=None):
+        query = AuditLog.query
+
+        if filters:
+            if filters.get('start_time'):
+                from dateutil import parser
+                try:
+                    start_time = parser.parse(filters['start_time'])
+                    query = query.filter(AuditLog.timestamp >= start_time)
+                except:
+                    pass
+
+            if filters.get('end_time'):
+                from dateutil import parser
+                try:
+                    end_time = parser.parse(filters['end_time'])
+                    query = query.filter(AuditLog.timestamp <= end_time)
+                except:
+                    pass
+
+            if filters.get('action'):
+                query = query.filter(AuditLog.action == filters['action'])
+
+            if filters.get('target_operator'):
+                query = query.filter(AuditLog.operator.ilike(f"%{filters['target_operator']}%"))
+
+            if filters.get('resource_type'):
+                query = query.filter(AuditLog.resource_type == filters['resource_type'])
+
+            if filters.get('certificate_id'):
+                query = query.filter(AuditLog.certificate_id == filters['certificate_id'])
+
+            if filters.get('equipment_id'):
+                query = query.filter(AuditLog.equipment_id == filters['equipment_id'])
+
+            if filters.get('batch_id'):
+                query = query.filter(AuditLog.batch_id.ilike(f"%{filters['batch_id']}%"))
+
+        return query.order_by(AuditLog.timestamp.desc())
+
+    def query_audit_logs(self, operator, filters=None, page=1, per_page=20):
+        role = self.check_query_permission(operator)
+
+        query = self._build_query(filters)
+
+        if role == UserRole.METROLOGIST.value:
+            query = query.filter(AuditLog.operator == operator)
+
+        pagination = query.paginate(page=page, per_page=per_page, error_out=False)
+
+        filter_desc = []
+        if filters:
+            for k, v in filters.items():
+                if v:
+                    filter_desc.append(f"{k}={v}")
+        
+        audit = AuditLog(
+            operator=operator,
+            action='audit_query',
+            resource_type='audit',
+            notes=f"Query audit logs with filters: {', '.join(filter_desc) if filter_desc else 'none'}",
+            details=json.dumps({
+                'filters': filters,
+                'page': page,
+                'per_page': per_page,
+                'role': role
+            }),
+            version=1
+        )
+        db.session.add(audit)
+        db.session.commit()
+
+        return {
+            'items': [log.to_dict() for log in pagination.items],
+            'total': pagination.total,
+            'page': page,
+            'per_page': per_page,
+            'pages': pagination.pages,
+            'has_next': pagination.has_next,
+            'has_prev': pagination.has_prev
+        }
+
+    def export_audit_logs_csv(self, operator, filters=None):
+        self.check_export_permission(operator)
+
+        query = self._build_query(filters)
+        logs = query.limit(self._get_export_max_rows()).all()
+
+        import io
+        output = io.StringIO()
+        output.write('\ufeff')
+
+        writer = None
+        for log in logs:
+            row = {
+                '时间': log.timestamp.isoformat() if log.timestamp else '',
+                '操作人': log.operator,
+                '角色': RolePermissionService._get_role_display_name(
+                    RolePermissionService.get_user_role(log.operator)
+                ),
+                '操作类型': log.action,
+                '目标对象': f"{log.resource_type}:{log.resource_id}" if log.resource_id else log.resource_type,
+                '变更摘要': self._get_change_summary(log)
+            }
+            
+            if writer is None:
+                writer = __import__('csv').DictWriter(output, fieldnames=row.keys())
+                writer.writeheader()
+            
+            writer.writerow(row)
+
+        csv_content = output.getvalue()
+
+        audit = AuditLog(
+            operator=operator,
+            action='audit_export',
+            resource_type='audit',
+            notes=f"Exported {len(logs)} audit logs to CSV",
+            details=json.dumps({'filters': filters, 'row_count': len(logs)}),
+            version=1
+        )
+        db.session.add(audit)
+        db.session.commit()
+
+        return csv_content
+
+    def _get_change_summary(self, log):
+        if log.action in ['enter', 'review', 'approve', 'release', 'limit', 'stop', 'revert']:
+            if log.previous_state and log.new_state:
+                return f"{log.previous_state} -> {log.new_state}"
+            elif log.new_state:
+                return f"-> {log.new_state}"
+            elif log.previous_state:
+                return f"{log.previous_state} ->"
+        elif log.action == 'import':
+            return f"导入证书 {log.resource_id}"
+        elif log.action == 'permission_denied':
+            return f"权限拒绝: {log.denied_reason}"
+        return log.notes[:100] if log.notes else ''
+
+    def _calculate_record_hash(self, log):
+        import hashlib
+        data = f"{log.id}{log.timestamp}{log.operator}{log.action}{log.resource_type}{log.resource_id}"
+        return hashlib.sha256(data.encode()).hexdigest()
+
+    def archive_old_logs(self):
+        retention_days = self._get_retention_days()
+        cutoff_time = datetime.now(timezone.utc) - timedelta(days=retention_days)
+
+        old_logs = AuditLog.query.filter(AuditLog.timestamp < cutoff_time).all()
+        
+        if not old_logs:
+            return {
+                'success': True,
+                'message': 'No logs to archive',
+                'archived_count': 0,
+                'failed_count': 0,
+                'errors': []
+            }
+
+        original_count = len(old_logs)
+        archived_count = 0
+        failed_count = 0
+        errors = []
+
+        try:
+            for log in old_logs:
+                expected_hash = self._calculate_record_hash(log)
+
+                archive_record = AuditArchive(
+                    audit_log_id=log.id,
+                    timestamp=log.timestamp,
+                    operator=log.operator,
+                    action=log.action,
+                    resource_type=log.resource_type,
+                    resource_id=log.resource_id,
+                    equipment_id=log.equipment_id,
+                    certificate_id=log.certificate_id,
+                    batch_id=log.batch_id,
+                    details=log.details,
+                    notes=log.notes,
+                    decision_basis=log.decision_basis,
+                    version=log.version,
+                    previous_state=log.previous_state,
+                    new_state=log.new_state,
+                    reverted=log.reverted,
+                    reverted_by=log.reverted_by,
+                    reverted_at=log.reverted_at,
+                    revert_log_id=log.revert_log_id,
+                    denied_reason=log.denied_reason,
+                    check_hash=expected_hash
+                )
+                db.session.add(archive_record)
+
+            db.session.flush()
+
+            archived_before_count = AuditArchive.query.filter(
+                AuditArchive.audit_log_id.in_([log.id for log in old_logs])
+            ).count()
+
+            if archived_before_count != original_count:
+                db.session.rollback()
+                errors.append(f"Archive count mismatch: expected {original_count}, got {archived_before_count}")
+                return {
+                    'success': False,
+                    'message': 'Archive verification failed',
+                    'archived_count': 0,
+                    'failed_count': original_count,
+                    'errors': errors
+                }
+
+            for log in old_logs:
+                archived_record = AuditArchive.query.filter_by(audit_log_id=log.id).first()
+                if archived_record.check_hash != self._calculate_record_hash(log):
+                    db.session.rollback()
+                    errors.append(f"Hash verification failed for audit log {log.id}")
+                    return {
+                        'success': False,
+                        'message': 'Hash verification failed',
+                        'archived_count': 0,
+                        'failed_count': original_count,
+                        'errors': errors
+                    }
+
+            for log in old_logs:
+                db.session.delete(log)
+
+            db.session.commit()
+
+            audit = AuditLog(
+                operator='SYSTEM_ARCHIVE',
+                action='audit_archive',
+                resource_type='audit',
+                notes=f"Archived {original_count} audit logs older than {retention_days} days",
+                details=json.dumps({
+                    'retention_days': retention_days,
+                    'archived_count': original_count,
+                    'cutoff_time': cutoff_time.isoformat()
+                }),
+                version=1,
+                new_state=f'archived:{original_count}'
+            )
+            db.session.add(audit)
+            db.session.commit()
+
+            return {
+                'success': True,
+                'message': f'Successfully archived {original_count} audit logs',
+                'archived_count': original_count,
+                'failed_count': 0,
+                'errors': []
+            }
+
+        except Exception as e:
+            db.session.rollback()
+            errors.append(str(e))
+            return {
+                'success': False,
+                'message': 'Archive operation failed',
+                'archived_count': archived_count,
+                'failed_count': original_count - archived_count,
+                'errors': errors
+            }

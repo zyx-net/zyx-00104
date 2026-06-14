@@ -1,66 +1,13 @@
-﻿{
-  "expiry_warning_days": 60,
-  "expiry_check_interval_hours": 12,
+{
+  "expiry_warning_days": 30,
+  "expiry_check_interval_hours": 24,
+  "audit": {
+    "retention_days": 90,
+    "export_max_rows": 10000,
+    "auto_reload": true,
+    "reload_interval_seconds": 5,
+    "archive_time_hour": 3
+  },
   "expiry_check_in_progress": false,
-  "last_expiry_check_time": "2026-06-14T08:02:39.783660",
-  "statistics": {
-    "export_max_size_mb": 20,
-    "default_time_range_days": 180,
-    "auto_reload": true,
-    "reload_interval_seconds": 5
-  },
-  "report": {
-    "storage_path": "./reports",
-    "template": {
-      "header": "校准证书",
-      "footer": "本证书经授权签发",
-      "logo": null
-    },
-    "decision_rules": {
-      "qualified": {
-        "description": "合格",
-        "condition": "deviation <= tolerance"
-      },
-      "unqualified": {
-        "description": "不合格",
-        "condition": "deviation > tolerance * 2"
-      },
-      "limited": {
-        "description": "限用",
-        "condition": "tolerance < deviation <= tolerance * 2"
-      }
-    },
-    "uncertainty_fields": [
-      {
-        "name": "standard_uncertainty",
-        "label": "标准不确定度",
-        "unit": "%"
-      },
-      {
-        "name": "expanded_uncertainty",
-        "label": "扩展不确定度",
-        "unit": "%"
-      },
-      {
-        "name": "coverage_factor",
-        "label": "包含因子",
-        "unit": "k"
-      }
-    ],
-    "auto_reload": true,
-    "reload_interval_seconds": 5
-  },
-  "scheduler": {
-    "default_priority": 99,
-    "urgent_priority": 10,
-    "periodic_priority": 5,
-    "batch_priority": 3,
-    "auto_create_next_periodic": true,
-    "default_period_days": 180,
-    "task_reminder_days": 14,
-    "max_tasks_per_equipment": 1,
-    "allow_force_override": true,
-    "auto_reload": true,
-    "reload_interval_seconds": 5
-  }
+  "last_expiry_check_time": "2026-06-14T08:46:44.596573"
 }

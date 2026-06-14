@@ -349,3 +349,58 @@ class CalibrationTask(db.Model):
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None
         }
+
+
+class AuditArchive(db.Model):
+    __tablename__ = 'audit_archive'
+
+    id = db.Column(db.Integer, primary_key=True)
+    audit_log_id = db.Column(db.Integer, nullable=False)
+    timestamp = db.Column(db.DateTime, nullable=False)
+    operator = db.Column(db.String(100), nullable=False)
+    action = db.Column(db.String(50), nullable=False)
+    resource_type = db.Column(db.String(50), nullable=False)
+    resource_id = db.Column(db.Integer)
+    equipment_id = db.Column(db.Integer)
+    certificate_id = db.Column(db.Integer)
+    batch_id = db.Column(db.String(100), index=True)
+    details = db.Column(db.Text)
+    notes = db.Column(db.Text)
+    decision_basis = db.Column(db.Text)
+    version = db.Column(db.Integer, default=1)
+    previous_state = db.Column(db.Text)
+    new_state = db.Column(db.Text)
+    reverted = db.Column(db.Boolean, default=False)
+    reverted_by = db.Column(db.String(100))
+    reverted_at = db.Column(db.DateTime)
+    revert_log_id = db.Column(db.Integer)
+    denied_reason = db.Column(db.Text)
+    archived_at = db.Column(db.DateTime, default=datetime.utcnow)
+    check_hash = db.Column(db.String(64))
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'audit_log_id': self.audit_log_id,
+            'timestamp': self.timestamp.isoformat() if self.timestamp else None,
+            'operator': self.operator,
+            'action': self.action,
+            'resource_type': self.resource_type,
+            'resource_id': self.resource_id,
+            'equipment_id': self.equipment_id,
+            'certificate_id': self.certificate_id,
+            'batch_id': self.batch_id,
+            'details': self.details,
+            'notes': self.notes,
+            'decision_basis': self.decision_basis,
+            'version': self.version,
+            'previous_state': self.previous_state,
+            'new_state': self.new_state,
+            'reverted': self.reverted,
+            'reverted_by': self.reverted_by,
+            'reverted_at': self.reverted_at.isoformat() if self.reverted_at else None,
+            'revert_log_id': self.revert_log_id,
+            'denied_reason': self.denied_reason,
+            'archived_at': self.archived_at.isoformat() if self.archived_at else None,
+            'check_hash': self.check_hash
+        }

@@ -475,6 +475,167 @@ curl "http://localhost:5000/api/audit?batch_id=BATCH-2024-001"
 curl "http://localhost:5000/api/audit?action=permission_denied"
 ```
 
+### 审计日志查询模块
+
+#### 功能概述
+
+审计日志查询模块提供完整的操作日志查询、筛选、导出和自动归档功能，支持角色权限控制：
+- **主管**：查看全部审计日志，可导出CSV
+- **计量员**：仅查看自己操作的日志
+- **录入员**：无权访问审计日志
+
+#### 高级查询接口
+
+```bash
+curl "http://localhost:5000/api/audit/search?operator=Supervisor1&start_time=2026-01-01T00:00:00&end_time=2026-12-31T23:59:59&action=approve"
+```
+
+**查询参数**：
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| operator | string | 必填，当前操作者用户名 |
+| start_time | string | 开始时间（ISO格式） |
+| end_time | string | 结束时间（ISO格式） |
+| action | string | 操作类型筛选 |
+| resource_type | string | 资源类型筛选 |
+| certificate_id | int | 证书ID筛选 |
+| equipment_id | int | 设备ID筛选 |
+| batch_id | string | 批次ID筛选 |
+| page | int | 页码，默认1 |
+| per_page | int | 每页条数，默认20，最大100 |
+
+**响应示例**：
+```json
+{
+  "items": [
+    {
+      "id": 1,
+      "timestamp": "2026-06-14T10:30:00",
+      "operator": "Supervisor1",
+      "action": "approve",
+      "resource_type": "certificate",
+      "resource_id": 123,
+      "notes": "Approved certificate",
+      ...
+    }
+  ],
+  "total": 150,
+  "page": 1,
+  "per_page": 20,
+  "pages": 8,
+  "has_next": true,
+  "has_prev": false
+}
+```
+
+#### 角色权限控制
+
+**主管权限**：
+```bash
+curl "http://localhost:5000/api/audit/search?operator=Supervisor1"
+# 返回所有审计日志
+```
+
+**计量员权限**：
+```bash
+curl "http://localhost:5000/api/audit/search?operator=Metrologist1"
+# 仅返回该计量员操作的日志
+```
+
+**录入员权限**：
+```bash
+curl "http://localhost:5000/api/audit/search?operator=Operator1"
+# 返回 403 Forbidden
+```
+
+#### CSV导出接口
+
+仅主管可导出审计日志：
+
+```bash
+curl "http://localhost:5000/api/audit/export?operator=Supervisor1&start_time=2026-01-01" -o audit_logs.csv
+```
+
+**导出字段**：
+- 时间
+- 操作人
+- 角色
+- 操作类型
+- 目标对象
+- 变更摘要
+
+#### 手动归档接口
+
+```bash
+curl -X POST http://localhost:5000/api/audit/archive \
+  -H "Content-Type: application/json" \
+  -d '{"operator": "Supervisor1"}'
+```
+
+**响应示例**：
+```json
+{
+  "success": true,
+  "message": "Successfully archived 150 audit logs",
+  "archived_count": 150,
+  "failed_count": 0,
+  "errors": []
+}
+```
+
+#### 审计配置管理
+
+查看审计配置：
+```bash
+curl http://localhost:5000/api/config/statistics
+```
+
+**配置项说明**（config.json）：
+```json
+{
+  "audit": {
+    "retention_days": 90,
+    "export_max_rows": 10000,
+    "auto_reload": true,
+    "reload_interval_seconds": 5,
+    "archive_time_hour": 3
+  }
+}
+```
+
+| 配置项 | 说明 | 默认值 |
+|--------|------|--------|
+| retention_days | 日志保留天数，超期自动归档 | 90 |
+| export_max_rows | CSV导出最大行数限制 | 10000 |
+| auto_reload | 是否启用配置热加载 | true |
+| reload_interval_seconds | 热加载检查间隔（秒） | 5 |
+| archive_time_hour | 自动归档执行时间（小时） | 3（凌晨3点） |
+
+#### 自动归档机制
+
+系统在每天凌晨3点自动执行归档任务：
+1. 将超过保留天数的日志迁移到 `audit_archive` 表
+2. 迁移前校验记录条数和关键字段哈希值
+3. 校验失败时回滚并记录告警日志
+4. 归档操作本身记录审计日志
+
+#### 查询审计记录
+
+每次查询审计日志时，系统会自动记录查询行为：
+```json
+{
+  "action": "audit_query",
+  "resource_type": "audit",
+  "notes": "Query audit logs with filters: action=approve",
+  "details": {
+    "filters": {"action": "approve"},
+    "page": 1,
+    "per_page": 20,
+    "role": "supervisor"
+  }
+}
+```
+
 ### 数据导出
 
 #### 按设备导出 JSON
