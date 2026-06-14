@@ -188,11 +188,13 @@ curl -X POST http://localhost:5000/api/certificates/1/approve \
 curl -X POST http://localhost:5000/api/certificates/1/release \
   -H "Content-Type: application/json" \
   -d '{
-    "operator": "Operator2",
+    "operator": "Supervisor2",
     "notes": "Device cleared for use",
     "decision_basis": "All checks passed"
   }'
 ```
+
+> **注意**：放行操作需要主管角色（supervisor）。录入员和计量员无权执行放行操作。
 
 #### 限用（Limit）
 ```bash
@@ -367,7 +369,7 @@ curl "http://localhost:5000/api/certificates/search?sort_by=calibration_date&sor
       "entered_by": "Operator1",
       "reviewed_by": "Metrologist1",
       "approved_by": "Supervisor1",
-      "released_by": "Operator2",
+      "released_by": "Supervisor2",
       "version": 4,
       "created_at": "2024-06-01T10:00:00",
       "updated_at": "2024-06-01T12:00:00"
@@ -538,14 +540,14 @@ curl -X POST http://localhost:5000/api/certificates/batch/approve \
 curl -X POST http://localhost:5000/api/certificates/batch/release \
   -H "Content-Type: application/json" \
   -d '{
-    "operator": "Operator2",
+    "operator": "Supervisor2",
     "certificate_ids": [1, 2, 3],
     "notes": "Batch release",
     "decision_basis": "All checks passed"
   }'
 ```
 
-响应示例（包含权限检查失败）：
+响应示例（包含状态验证失败）：
 ```json
 {
   "total": 3,
@@ -557,17 +559,19 @@ curl -X POST http://localhost:5000/api/certificates/batch/release \
       "certificate_id": 2,
       "cert_no": "CERT-002",
       "success": false,
-      "errors": [{"error": "Operator cannot release their own entry", "field": "operator"}]
+      "errors": [{"error": "Invalid transition from draft to released", "field": "workflow_status"}]
     },
     {
       "certificate_id": 3,
       "cert_no": "CERT-003",
       "success": false,
-      "errors": [{"error": "Invalid transition from draft to released", "field": "workflow_status"}]
+      "errors": [{"error": "Invalid transition from reviewed to released", "field": "workflow_status"}]
     }
   ]
 }
 ```
+
+> **注意**：批量放行操作需要主管角色（supervisor），且证书必须处于 `approved` 状态。
 
 #### 批量操作特点
 - **非原子性**：每个证书独立处理，一个失败不影响其他
@@ -754,7 +758,7 @@ curl -X POST http://localhost:5000/api/certificates/import \
 }
 ```
 
-### 4. 录入员尝试放行错误
+### 4. 录入员越权放行（权限拒绝）
 ```bash
 curl -X POST http://localhost:5000/api/certificates/1/release \
   -H "Content-Type: application/json" \
@@ -766,13 +770,56 @@ curl -X POST http://localhost:5000/api/certificates/1/release \
 响应：
 ```json
 {
-  "errors": [
-    {
-      "error": "Operator cannot release their own entry",
-      "field": "operator"
-    }
-  ],
-  "message": "Release failed"
+  "error": "Action 'release' requires role: 主管, but user has role: 录入员",
+  "required_role": ["supervisor"],
+  "operator_role": "operator",
+  "action": "release",
+  "resource_type": "certificate",
+  "resource_id": 1
+}
+```
+
+### 5. 录入员越权复核（权限拒绝）
+```bash
+curl -X POST http://localhost:5000/api/certificates/1/review \
+  -H "Content-Type: application/json" \
+  -d '{
+    "operator": "Operator1",
+    "decision_basis": "Try to review"
+  }'
+```
+
+响应：
+```json
+{
+  "error": "Action 'review' requires role: 计量员/主管, but user has role: 录入员",
+  "required_role": ["metrologist", "supervisor"],
+  "operator_role": "operator",
+  "action": "review",
+  "resource_type": "certificate",
+  "resource_id": 1
+}
+```
+
+### 6. 计量员越权放行（权限拒绝）
+```bash
+curl -X POST http://localhost:5000/api/certificates/1/release \
+  -H "Content-Type: application/json" \
+  -d '{
+    "operator": "Metrologist1",
+    "decision_basis": "Try to release"
+  }'
+```
+
+响应：
+```json
+{
+  "error": "Action 'release' requires role: 主管, but user has role: 计量员",
+  "required_role": ["supervisor"],
+  "operator_role": "metrologist",
+  "action": "release",
+  "resource_type": "certificate",
+  "resource_id": 1
 }
 ```
 
@@ -922,16 +969,77 @@ curl -X POST http://localhost:5000/api/scheduler/stop
 3. **持久化配置**：调度器配置保存在 `config.json` 中，重启后恢复
 4. **冲突保护**：如果检测任务正在运行，手动触发会返回 409 Conflict
 
+### 配置修改与重启验证
+
+修改检测频率后重启服务，配置会持久化保存：
+
+```bash
+# 1. 修改检测频率为 12 小时
+curl -X PUT http://localhost:5000/api/config/expiry-check-interval \
+  -H "Content-Type: application/json" \
+  -d '{"hours": 12}'
+
+# 响应：
+{
+  "expiry_check_interval_hours": 12,
+  "message": "Expiry check interval updated to 12 hours"
+}
+
+# 2. 查看配置文件确认已保存
+cat config.json
+# {
+#   "expiry_warning_days": 60,
+#   "expiry_check_interval_hours": 12,
+#   "expiry_check_in_progress": false,
+#   "last_expiry_check_time": "2026-06-14T10:00:00"
+# }
+
+# 3. 重启服务
+# Ctrl+C 停止服务，然后重新启动
+python app.py
+
+# 4. 验证配置未丢失
+curl http://localhost:5000/api/config/expiry-check-interval
+# 响应：
+{
+  "expiry_check_interval_hours": 12,
+  "last_check_time": "2026-06-14T10:00:00",
+  "check_in_progress": false
+}
+
+# 5. 验证调度器按新频率运行
+curl http://localhost:5000/api/scheduler/status
+# 响应：
+{
+  "running": true,
+  "check_interval_hours": 12,
+  "last_check_time": "2026-06-14T10:00:00",
+  "check_in_progress": false
+}
+```
+
 ### 并发冲突保护
 
 当定时检测任务正在执行时，如果有人手动调用过期处理接口，系统会返回 409 Conflict：
 
-```json
+```bash
+# 场景：定时任务正在执行过期检测
+# 此时手动触发过期处理
+
+curl -X POST http://localhost:5000/api/certificates/expiry-process
+
+# 响应（409 Conflict）：
 {
   "error": "Another expiry check is already in progress",
   "conflict": true
 }
 ```
+
+**冲突保护机制说明**：
+- 系统使用 `expiry_check_in_progress` 标志位防止并发执行
+- 定时任务开始时设置标志位为 `true`，结束时设置为 `false`
+- 手动触发时检查标志位，如果为 `true` 则返回 409
+- 这确保了过期处理不会重复执行，避免数据冲突
 
 ## 目录结构
 

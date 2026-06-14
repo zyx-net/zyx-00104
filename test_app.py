@@ -343,6 +343,8 @@ def test_operator_cannot_release_own_entry(client, sample_equipment):
     assert release_response.status_code == 403
     release_data = json.loads(release_response.data)
     assert 'release' in release_data['error'].lower()
+    assert release_data['required_role'] == ['supervisor']
+    assert release_data['operator_role'] == 'operator'
 
 def test_audit_log_completeness(client, sample_equipment):
     import_response = client.post('/api/certificates/import',

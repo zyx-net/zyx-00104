@@ -521,6 +521,8 @@ class TestPermissionDenied:
         assert latest_denied['operator'] == sample_users['operator']
         assert 'review' in latest_denied['notes'].lower()
         assert latest_denied['denied_reason'] is not None
+        assert 'review' in latest_denied['denied_reason'].lower()
+        assert 'requires role' in latest_denied['denied_reason'].lower()
 
     def test_operator_cannot_release_own_entry_still_enforced(self, client, sample_equipment, sample_users):
         """测试录入员不能放行自己的单仍然生效（权限检查优先）"""
