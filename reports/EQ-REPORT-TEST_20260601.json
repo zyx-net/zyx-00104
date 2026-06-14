@@ -1,6 +1,6 @@
 {
   "report_no": "RPT-EQ-REPORT-TEST-20260601",
-  "header": "校准证书报告",
+  "header": "??????",
   "certificate": {
     "id": 1,
     "cert_no": "CERT-REPORT-TEST",
@@ -26,8 +26,8 @@
     "released_by": null,
     "released_at": null,
     "version": 1,
-    "created_at": "2026-06-14T06:28:40.523145",
-    "updated_at": "2026-06-14T06:28:40.523150"
+    "created_at": "2026-06-14T08:02:43.433036",
+    "updated_at": "2026-06-14T08:02:43.433041"
   },
   "equipment": {
     "id": 1,
@@ -41,16 +41,16 @@
     "tolerance": 0.05,
     "location": null,
     "status": "active",
-    "created_at": "2026-06-14T06:28:40.521824",
-    "updated_at": "2026-06-14T06:28:40.521829"
+    "created_at": "2026-06-14T08:02:43.431557",
+    "updated_at": "2026-06-14T08:02:43.431562"
   },
-  "decision_result": "合格",
+  "decision_result": "??",
   "uncertainty": {
     "standard_uncertainty": null,
     "expanded_uncertainty": null,
     "coverage_factor": null
   },
   "generated_by": "Supervisor1",
-  "generated_at": "2026-06-14T06:28:40.531536",
-  "footer": "计量校准中心"
+  "generated_at": "2026-06-14T08:02:43.445214",
+  "footer": "??????"
 }

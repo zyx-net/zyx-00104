@@ -2,6 +2,7 @@ from models import db, Certificate, Equipment, AuditLog, WorkflowStatus, User, U
 from validators import CertificateValidator, CertificateImportSchema, parse_csv_to_json
 from marshmallow import ValidationError
 from datetime import datetime, timedelta, date
+from sqlalchemy import func
 import json
 import uuid
 import os
@@ -22,8 +23,8 @@ class PermissionDeniedException(Exception):
 
 class RolePermissionService:
     ROLE_HIERARCHY = {
-        UserRole.SUPERVISOR.value: ['import', 'enter', 'review', 'approve', 'release', 'limit', 'stop', 'revert'],
-        UserRole.METROLOGIST.value: ['import', 'enter', 'review'],
+        UserRole.SUPERVISOR.value: ['import', 'enter', 'review', 'approve', 'release', 'limit', 'stop', 'revert', 'view_statistics'],
+        UserRole.METROLOGIST.value: ['import', 'enter', 'review', 'view_statistics'],
         UserRole.OPERATOR.value: ['import', 'enter']
     }
 
@@ -35,7 +36,8 @@ class RolePermissionService:
         'release': [UserRole.SUPERVISOR.value],
         'limit': [UserRole.SUPERVISOR.value],
         'stop': [UserRole.SUPERVISOR.value],
-        'revert': [UserRole.SUPERVISOR.value]
+        'revert': [UserRole.SUPERVISOR.value],
+        'view_statistics': [UserRole.METROLOGIST.value, UserRole.SUPERVISOR.value]
     }
 
     @staticmethod
@@ -261,6 +263,38 @@ class ConfigService:
         if 'scheduler' not in self._config:
             self._config['scheduler'] = {}
         self._config['scheduler'][key] = value
+        self._save_config()
+        return value
+
+    def get_statistics_config(self):
+        self._check_reload()
+        return self._config.get('statistics', {
+            'export_max_size_mb': 10,
+            'default_time_range_days': 90,
+            'auto_reload': True,
+            'reload_interval_seconds': 5
+        })
+
+    def get_statistics_reload_interval_seconds(self):
+        self._check_reload()
+        stats_config = self._config.get('statistics', {})
+        return stats_config.get('reload_interval_seconds', 5)
+
+    def get_export_max_size_mb(self):
+        self._check_reload()
+        stats_config = self._config.get('statistics', {})
+        return stats_config.get('export_max_size_mb', 10)
+
+    def get_default_time_range_days(self):
+        self._check_reload()
+        stats_config = self._config.get('statistics', {})
+        return stats_config.get('default_time_range_days', 90)
+
+    def set_statistics_config(self, key, value):
+        self._check_reload()
+        if 'statistics' not in self._config:
+            self._config['statistics'] = {}
+        self._config['statistics'][key] = value
         self._save_config()
         return value
 
@@ -1395,6 +1429,159 @@ class ReportService:
         
         return report.to_dict(), None
 
+    def batch_generate_reports(self, certificate_ids, operator):
+        self.check_generation_permission(operator)
+        
+        locked_certs = [cid for cid in certificate_ids if self._check_certificate_locked(cid)]
+        if locked_certs:
+            raise CertificateLockedException(
+                message=f"Some certificates are locked: {locked_certs}",
+                certificate_ids=locked_certs
+            )
+        
+        self._lock_certificates(certificate_ids)
+        
+        results = {
+            'total': len(certificate_ids),
+            'successful': 0,
+            'failed': 0,
+            'results': [],
+            'batch_id': str(uuid.uuid4())
+        }
+        
+        try:
+            for cert_id in certificate_ids:
+                certificate = Certificate.query.get(cert_id)
+                
+                if not certificate:
+                    results['failed'] += 1
+                    results['results'].append({
+                        'certificate_id': cert_id,
+                        'success': False,
+                        'errors': ['Certificate not found']
+                    })
+                    continue
+                
+                if certificate.workflow_status not in [
+                    WorkflowStatus.APPROVED.value,
+                    WorkflowStatus.RELEASED.value,
+                    WorkflowStatus.LIMITED.value
+                ]:
+                    results['failed'] += 1
+                    results['results'].append({
+                        'certificate_id': cert_id,
+                        'cert_no': certificate.cert_no,
+                        'success': False,
+                        'errors': ['Certificate must be approved or released']
+                    })
+                    continue
+                
+                try:
+                    report_data, error = self.generate_report(cert_id, operator, force_overwrite=True, skip_lock_check=True)
+                    if error:
+                        results['failed'] += 1
+                        results['results'].append({
+                            'certificate_id': cert_id,
+                            'cert_no': certificate.cert_no,
+                            'success': False,
+                            'errors': [error.get('error', 'Unknown error')]
+                        })
+                    else:
+                        results['successful'] += 1
+                        results['results'].append({
+                            'certificate_id': cert_id,
+                            'cert_no': certificate.cert_no,
+                            'success': True,
+                            'report_id': report_data['id'],
+                            'report_no': report_data['report_no'],
+                            'version': report_data['version']
+                        })
+                except Exception as e:
+                    results['failed'] += 1
+                    results['results'].append({
+                        'certificate_id': cert_id,
+                        'cert_no': certificate.cert_no,
+                        'success': False,
+                        'errors': [str(e)]
+                    })
+            
+            return results
+        
+        finally:
+            self._unlock_certificates(certificate_ids)
+
+    def search_reports(self, filters=None):
+        query = Report.query
+        
+        if filters:
+            if filters.get('equipment_no'):
+                query = query.filter(Report.equipment_no.ilike(f"%{filters['equipment_no']}%"))
+            
+            if filters.get('certificate_id'):
+                query = query.filter(Report.certificate_id == filters['certificate_id'])
+            
+            if filters.get('status'):
+                query = query.filter(Report.status == filters['status'])
+            
+            if filters.get('calibration_date_from'):
+                from dateutil import parser
+                try:
+                    date_from = parser.parse(filters['calibration_date_from']).date()
+                    query = query.filter(Report.calibration_date >= date_from)
+                except:
+                    pass
+            
+            if filters.get('calibration_date_to'):
+                from dateutil import parser
+                try:
+                    date_to = parser.parse(filters['calibration_date_to']).date()
+                    query = query.filter(Report.calibration_date <= date_to)
+                except:
+                    pass
+            
+            if filters.get('generated_by'):
+                query = query.filter(Report.generated_by.ilike(f"%{filters['generated_by']}%"))
+        
+        reports = query.order_by(Report.generated_at.desc()).all()
+        return [report.to_dict() for report in reports]
+
+    def get_report_by_id(self, report_id):
+        return Report.query.get(report_id)
+
+    def revoke_report(self, report_id, operator):
+        self.check_generation_permission(operator)
+        
+        report = Report.query.get(report_id)
+        if not report:
+            return None, {'error': 'Report not found'}
+        
+        if report.revoked:
+            return None, {'error': 'Report is already revoked'}
+        
+        report.revoked = True
+        report.revoked_by = operator
+        report.revoked_at = datetime.utcnow()
+        report.status = ReportStatus.REVOKED.value
+        
+        audit = AuditLog(
+            operator=operator,
+            action='report_revoke',
+            resource_type='report',
+            resource_id=report.id,
+            certificate_id=report.certificate_id,
+            equipment_id=report.equipment_no,
+            notes=f"Report revoked: {report.report_no}",
+            decision_basis='Report revocation requested',
+            version=report.version,
+            previous_state=ReportStatus.GENERATED.value,
+            new_state=ReportStatus.REVOKED.value
+        )
+        db.session.add(audit)
+        
+        db.session.commit()
+        
+        return report.to_dict(), None
+
 
 class TaskConflictException(Exception):
     def __init__(self, message, conflicting_tasks):
@@ -1848,155 +2035,293 @@ class CalibrationTaskService:
             'has_prev': pagination.has_prev
         }
 
-    def batch_generate_reports(self, certificate_ids, operator):
-        self.check_generation_permission(operator)
-        
-        locked_certs = [cid for cid in certificate_ids if self._check_certificate_locked(cid)]
-        if locked_certs:
-            raise CertificateLockedException(
-                message=f"Some certificates are locked: {locked_certs}",
-                certificate_ids=locked_certs
+
+class StatisticsPermissionDeniedException(Exception):
+    def __init__(self, message, required_role, operator_role):
+        self.message = message
+        self.required_role = required_role
+        self.operator_role = operator_role
+        super().__init__(self.message)
+
+
+class CalibrationStatisticsService:
+    def __init__(self):
+        self._config_service = ConfigService()
+
+    def check_statistics_permission(self, operator):
+        role = RolePermissionService.get_user_role(operator)
+        if role not in RolePermissionService.REQUIRED_ROLES.get('view_statistics', []):
+            denied_reason = f"Viewing statistics requires metrologist or supervisor role, but user has: {role}"
+            audit = AuditLog(
+                operator=operator,
+                action='permission_denied',
+                resource_type='statistics',
+                notes=denied_reason,
+                denied_reason=denied_reason
             )
-        
-        self._lock_certificates(certificate_ids)
-        
-        results = {
-            'total': len(certificate_ids),
-            'successful': 0,
-            'failed': 0,
-            'results': [],
-            'batch_id': str(uuid.uuid4())
-        }
-        
-        try:
-            for cert_id in certificate_ids:
-                certificate = Certificate.query.get(cert_id)
-                
-                if not certificate:
-                    results['failed'] += 1
-                    results['results'].append({
-                        'certificate_id': cert_id,
-                        'success': False,
-                        'errors': ['Certificate not found']
-                    })
-                    continue
-                
-                if certificate.workflow_status not in [
-                    WorkflowStatus.APPROVED.value,
-                    WorkflowStatus.RELEASED.value,
-                    WorkflowStatus.LIMITED.value
-                ]:
-                    results['failed'] += 1
-                    results['results'].append({
-                        'certificate_id': cert_id,
-                        'cert_no': certificate.cert_no,
-                        'success': False,
-                        'errors': ['Certificate must be approved or released']
-                    })
-                    continue
-                
-                try:
-                    report_data, error = self.generate_report(cert_id, operator, force_overwrite=True, skip_lock_check=True)
-                    if error:
-                        results['failed'] += 1
-                        results['results'].append({
-                            'certificate_id': cert_id,
-                            'cert_no': certificate.cert_no,
-                            'success': False,
-                            'errors': [error.get('error', 'Unknown error')]
-                        })
-                    else:
-                        results['successful'] += 1
-                        results['results'].append({
-                            'certificate_id': cert_id,
-                            'cert_no': certificate.cert_no,
-                            'success': True,
-                            'report_id': report_data['id'],
-                            'report_no': report_data['report_no'],
-                            'version': report_data['version']
-                        })
-                except Exception as e:
-                    results['failed'] += 1
-                    results['results'].append({
-                        'certificate_id': cert_id,
-                        'cert_no': certificate.cert_no,
-                        'success': False,
-                        'errors': [str(e)]
-                    })
-            
-            return results
-        
-        finally:
-            self._unlock_certificates(certificate_ids)
-
-    def search_reports(self, filters=None):
-        query = Report.query
-        
-        if filters:
-            if filters.get('equipment_no'):
-                query = query.filter(Report.equipment_no.ilike(f"%{filters['equipment_no']}%"))
-            
-            if filters.get('certificate_id'):
-                query = query.filter(Report.certificate_id == filters['certificate_id'])
-            
-            if filters.get('status'):
-                query = query.filter(Report.status == filters['status'])
-            
-            if filters.get('calibration_date_from'):
-                from dateutil import parser
-                try:
-                    date_from = parser.parse(filters['calibration_date_from']).date()
-                    query = query.filter(Report.calibration_date >= date_from)
-                except:
-                    pass
-            
-            if filters.get('calibration_date_to'):
-                from dateutil import parser
-                try:
-                    date_to = parser.parse(filters['calibration_date_to']).date()
-                    query = query.filter(Report.calibration_date <= date_to)
-                except:
-                    pass
-            
-            if filters.get('generated_by'):
-                query = query.filter(Report.generated_by.ilike(f"%{filters['generated_by']}%"))
-        
-        reports = query.order_by(Report.generated_at.desc()).all()
-        return [report.to_dict() for report in reports]
-
-    def get_report_by_id(self, report_id):
-        return Report.query.get(report_id)
-
-    def revoke_report(self, report_id, operator):
-        self.check_generation_permission(operator)
-        
-        report = Report.query.get(report_id)
-        if not report:
-            return None, {'error': 'Report not found'}
-        
-        if report.revoked:
-            return None, {'error': 'Report is already revoked'}
-        
-        report.revoked = True
-        report.revoked_by = operator
-        report.revoked_at = datetime.utcnow()
-        report.status = ReportStatus.REVOKED.value
+            db.session.add(audit)
+            db.session.commit()
+            raise StatisticsPermissionDeniedException(
+                message=denied_reason,
+                required_role=['metrologist', 'supervisor'],
+                operator_role=role
+            )
         
         audit = AuditLog(
             operator=operator,
-            action='report_revoke',
-            resource_type='report',
-            resource_id=report.id,
-            certificate_id=report.certificate_id,
-            equipment_id=report.equipment_no,
-            notes=f"Report revoked: {report.report_no}",
-            decision_basis='Report revocation requested',
-            version=report.version,
-            previous_state=ReportStatus.GENERATED.value,
-            new_state=ReportStatus.REVOKED.value
+            action='view_statistics',
+            resource_type='statistics',
+            notes='Viewed calibration statistics dashboard',
+            version=1
         )
         db.session.add(audit)
+        db.session.commit()
+        return True
+
+    def get_statistics(self, operator, date_from=None, date_to=None):
+        role = RolePermissionService.get_user_role(operator)
+        default_days = self._config_service.get_default_time_range_days()
         
+        if not date_from:
+            date_to = date_to or datetime.now().date()
+            date_from = date_to - timedelta(days=default_days)
+        else:
+            from dateutil import parser
+            date_from = parser.parse(date_from).date() if isinstance(date_from, str) else date_from
+            date_to = parser.parse(date_to).date() if date_to and isinstance(date_to, str) else (date_to or datetime.now().date())
+        
+        overview = self._get_overview_data(date_from, date_to, role, operator)
+        equipment_coverage = self._get_equipment_coverage(role, operator)
+        calibrator_workload = self._get_calibrator_workload(date_from, date_to, role, operator)
+        
+        return {
+            'overview': overview,
+            'equipment_coverage': equipment_coverage,
+            'calibrator_workload': calibrator_workload,
+            'filter': {
+                'date_from': date_from.isoformat() if date_from else None,
+                'date_to': date_to.isoformat() if date_to else None,
+                'role': role
+            }
+        }
+
+    def _get_overview_data(self, date_from, date_to, role, operator):
+        today = date.today()
+        warning_days = self._config_service.get_expiry_warning_days()
+        expiry_threshold = today + timedelta(days=warning_days)
+        
+        cert_query = Certificate.query.join(Equipment)
+        
+        if role == UserRole.METROLOGIST.value:
+            cert_query = cert_query.filter(Certificate.reviewed_by == operator)
+        elif role == UserRole.OPERATOR.value:
+            cert_query = cert_query.filter(False)
+        
+        total_certs = cert_query.count()
+        
+        expiring_count = cert_query.filter(
+            Certificate.valid_until <= expiry_threshold,
+            Certificate.valid_until >= today,
+            Certificate.workflow_status.in_([
+                WorkflowStatus.DRAFT.value,
+                WorkflowStatus.ENTERED.value,
+                WorkflowStatus.REVIEWED.value,
+                WorkflowStatus.APPROVED.value,
+                WorkflowStatus.RELEASED.value
+            ])
+        ).count()
+        
+        current_month_start = today.replace(day=1)
+        new_this_month = cert_query.filter(
+            Certificate.calibration_date >= current_month_start
+        ).count()
+        
+        pending_review = 0
+        pending_approve = 0
+        
+        if role == UserRole.SUPERVISOR.value:
+            pending_review = Certificate.query.filter(
+                Certificate.workflow_status == WorkflowStatus.ENTERED.value
+            ).count()
+            pending_approve = Certificate.query.filter(
+                Certificate.workflow_status == WorkflowStatus.REVIEWED.value
+            ).count()
+        elif role == UserRole.METROLOGIST.value:
+            pending_review = Certificate.query.filter(
+                Certificate.workflow_status == WorkflowStatus.ENTERED.value
+            ).count()
+        else:
+            pending_review = 0
+            pending_approve = 0
+        
+        completion_rate = 0.0
+        if total_certs > 0:
+            completed = cert_query.filter(
+                Certificate.workflow_status.in_([
+                    WorkflowStatus.RELEASED.value,
+                    WorkflowStatus.LIMITED.value,
+                    WorkflowStatus.STOPPED.value
+                ])
+            ).count()
+            completion_rate = round((completed / total_certs) * 100, 2)
+        
+        return {
+            'expiring_warning_count': expiring_count,
+            'new_this_month': new_this_month,
+            'pending_review': pending_review,
+            'pending_approve': pending_approve,
+            'completion_rate': completion_rate,
+            'total_certificates': total_certs,
+            'warning_days': warning_days
+        }
+
+    def _get_equipment_coverage(self, role, operator):
+        if role == UserRole.SUPERVISOR.value:
+            cert_query = Certificate.query
+            equipment_query = Equipment.query
+        elif role == UserRole.METROLOGIST.value:
+            cert_query = Certificate.query.filter(Certificate.reviewed_by == operator)
+            equipment_query = Equipment.query
+        else:
+            return []
+        
+        equipment_groups = db.session.query(
+            Equipment.model_spec,
+            func.count(Certificate.id).label('cert_count'),
+            func.count(func.distinct(Certificate.equipment_id)).label('equipment_count')
+        ).join(
+            Certificate, Equipment.id == Certificate.equipment_id
+        ).group_by(
+            Equipment.model_spec
+        ).all()
+        
+        total_equipment = equipment_query.count()
+        result = []
+        
+        for model_spec, cert_count, equip_count in equipment_groups:
+            coverage = round((equip_count / total_equipment) * 100, 2) if total_equipment > 0 else 0
+            result.append({
+                'model_spec': model_spec or '未分类',
+                'certificate_count': cert_count,
+                'equipment_count': equip_count,
+                'coverage_rate': coverage
+            })
+        
+        return sorted(result, key=lambda x: x['certificate_count'], reverse=True)
+
+    def _get_calibrator_workload(self, date_from, date_to, role, operator):
+        if role == UserRole.SUPERVISOR.value:
+            task_query = CalibrationTask.query
+        elif role == UserRole.METROLOGIST.value:
+            task_query = CalibrationTask.query.filter(
+                db.or_(
+                    CalibrationTask.calibrator == operator,
+                    CalibrationTask.accepted_by == operator
+                )
+            )
+        else:
+            return []
+        
+        if date_from:
+            task_query = task_query.filter(
+                db.or_(
+                    CalibrationTask.planned_date >= date_from,
+                    CalibrationTask.planned_date == None
+                )
+            )
+        if date_to:
+            task_query = task_query.filter(
+                db.or_(
+                    CalibrationTask.planned_date <= date_to,
+                    CalibrationTask.planned_date == None
+                )
+            )
+        
+        workload = db.session.query(
+            CalibrationTask.calibrator,
+            func.count(CalibrationTask.id).label('total_tasks'),
+            func.sum(
+                db.case(
+                    (CalibrationTask.status == TaskStatus.PENDING.value, 1),
+                    (CalibrationTask.status == TaskStatus.ACCEPTED.value, 1),
+                    (CalibrationTask.status == TaskStatus.IN_PROGRESS.value, 1),
+                    else_=0
+                )
+            ).label('pending_tasks'),
+            func.sum(
+                db.case(
+                    (CalibrationTask.status == TaskStatus.COMPLETED.value, 1),
+                    else_=0
+                )
+            ).label('completed_tasks')
+        ).group_by(
+            CalibrationTask.calibrator
+        ).all()
+        
+        result = []
+        for calibrator, total, pending, completed in workload:
+            if calibrator:
+                completion_rate = round((completed / total) * 100, 2) if total > 0 else 0
+                result.append({
+                    'calibrator': calibrator,
+                    'total_tasks': total or 0,
+                    'pending_tasks': pending or 0,
+                    'completed_tasks': completed or 0,
+                    'completion_rate': completion_rate
+                })
+        
+        return sorted(result, key=lambda x: x['pending_tasks'], reverse=True)
+
+    def export_statistics_csv(self, operator, date_from=None, date_to=None):
+        self.check_statistics_permission(operator)
+        
+        stats = self.get_statistics(operator, date_from, date_to)
+        
+        max_size_mb = self._config_service.get_export_max_size_mb()
+        
+        import io
+        output = io.StringIO()
+        output.write('\ufeff')
+        
+        output.write("=== 校准统计看板 ===\n")
+        output.write(f"导出时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        output.write(f"时间范围: {stats['filter']['date_from']} 至 {stats['filter']['date_to']}\n")
+        output.write(f"用户角色: {stats['filter']['role']}\n\n")
+        
+        output.write("=== 概览数据 ===\n")
+        overview = stats['overview']
+        output.write(f"到期预警数: {overview['expiring_warning_count']}\n")
+        output.write(f"本月新增证书: {overview['new_this_month']}\n")
+        output.write(f"待复核数: {overview['pending_review']}\n")
+        output.write(f"待批准数: {overview['pending_approve']}\n")
+        output.write(f"完成率: {overview['completion_rate']}%\n")
+        output.write(f"证书总数: {overview['total_certificates']}\n\n")
+        
+        output.write("=== 设备类型校准覆盖率 ===\n")
+        output.write("设备类型,证书数量,设备数量,覆盖率(%)\n")
+        for item in stats['equipment_coverage']:
+            output.write(f"{item['model_spec']},{item['certificate_count']},{item['equipment_count']},{item['coverage_rate']}\n")
+        output.write("\n")
+        
+        output.write("=== 校准员任务负载 ===\n")
+        output.write("校准员,总任务数,待处理,已完成,完成率(%)\n")
+        for item in stats['calibrator_workload']:
+            output.write(f"{item['calibrator']},{item['total_tasks']},{item['pending_tasks']},{item['completed_tasks']},{item['completion_rate']}\n")
+        
+        csv_content = output.getvalue()
+        
+        estimated_size = len(csv_content.encode('utf-8')) / (1024 * 1024)
+        if estimated_size > max_size_mb:
+            raise Exception(f"导出文件大小 ({estimated_size:.2f}MB) 超过限制 ({max_size_mb}MB)")
+        
+        audit = AuditLog(
+            operator=operator,
+            action='export_statistics',
+            resource_type='statistics',
+            notes=f"Exported statistics to CSV, size: {estimated_size:.2f}MB",
+            version=1
+        )
+        db.session.add(audit)
         db.session.commit()
         
-        return report.to_dict(), None
+        return csv_content

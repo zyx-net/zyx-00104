@@ -1,9 +1,9 @@
 {
   "report_no": "RPT-EQ-TEST-001-20260601",
-  "header": "校准证书报告",
+  "header": "??????",
   "certificate": {
     "id": 2,
-    "cert_no": "CERT-BATCH-LOCK-1781418520-1",
+    "cert_no": "CERT-BATCH-LOCK-1781424162-1",
     "batch_id": "BATCH-LOCK-TEST",
     "equipment_id": 1,
     "equipment_no": "EQ-TEST-001",
@@ -26,8 +26,8 @@
     "released_by": null,
     "released_at": null,
     "version": 1,
-    "created_at": "2026-06-14T06:28:40.168027",
-    "updated_at": "2026-06-14T06:28:40.168032"
+    "created_at": "2026-06-14T08:02:42.942009",
+    "updated_at": "2026-06-14T08:02:42.942015"
   },
   "equipment": {
     "id": 1,
@@ -41,16 +41,16 @@
     "tolerance": 0.05,
     "location": "Lab 1",
     "status": "active",
-    "created_at": "2026-06-14T06:28:40.161085",
-    "updated_at": "2026-06-14T06:28:40.161090"
+    "created_at": "2026-06-14T08:02:42.932619",
+    "updated_at": "2026-06-14T08:02:42.932631"
   },
-  "decision_result": "合格",
+  "decision_result": "??",
   "uncertainty": {
     "standard_uncertainty": null,
     "expanded_uncertainty": null,
     "coverage_factor": null
   },
   "generated_by": "Supervisor1",
-  "generated_at": "2026-06-14T06:28:40.214597",
-  "footer": "计量校准中心"
+  "generated_at": "2026-06-14T08:02:43.005745",
+  "footer": "??????"
 }

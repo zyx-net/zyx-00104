@@ -1,8 +1,9 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from models import db, Equipment, Certificate, AuditLog, WorkflowStatus, Report, ReportStatus, CalibrationTask, TaskStatus, TaskType
-from services import CertificateImportService, WorkflowService, ExportService, ExpiryWarningService, BatchStatsService, ConfigService, BatchWorkflowService, RevertService, ExpiryAutoTransitionService, CertificateSearchService, RolePermissionService, UserService, PermissionDeniedException, ExpiryCheckConflictException, ScheduledTaskService, ReportService, ReportGenerationConflictException, CertificateLockedException, CalibrationTaskService, TaskConflictException
+from services import CertificateImportService, WorkflowService, ExportService, ExpiryWarningService, BatchStatsService, ConfigService, BatchWorkflowService, RevertService, ExpiryAutoTransitionService, CertificateSearchService, RolePermissionService, UserService, PermissionDeniedException, ExpiryCheckConflictException, ScheduledTaskService, ReportService, ReportGenerationConflictException, CertificateLockedException, CalibrationTaskService, TaskConflictException, CalibrationStatisticsService, StatisticsPermissionDeniedException
 from validators import parse_csv_to_json
+from datetime import datetime
 import os
 import json
 import io
@@ -1084,6 +1085,96 @@ def handle_task_conflict(e):
         'conflict': True,
         'conflicting_tasks': e.conflicting_tasks
     }), 409
+
+@app.errorhandler(StatisticsPermissionDeniedException)
+def handle_statistics_permission_denied(e):
+    return jsonify({
+        'error': e.message,
+        'required_role': e.required_role,
+        'operator_role': e.operator_role
+    }), 403
+
+
+@app.route('/api/statistics', methods=['GET'])
+def get_statistics():
+    operator = request.args.get('operator')
+    date_from = request.args.get('date_from')
+    date_to = request.args.get('date_to')
+
+    if not operator:
+        return jsonify({'error': 'Operator is required'}), 400
+
+    try:
+        stats_service = CalibrationStatisticsService()
+        stats_service.check_statistics_permission(operator)
+        stats = stats_service.get_statistics(operator, date_from, date_to)
+        return jsonify(stats)
+    except StatisticsPermissionDeniedException as e:
+        return jsonify({
+            'error': e.message,
+            'required_role': e.required_role,
+            'operator_role': e.operator_role
+        }), 403
+
+
+@app.route('/api/statistics/export', methods=['GET'])
+def export_statistics():
+    operator = request.args.get('operator')
+    date_from = request.args.get('date_from')
+    date_to = request.args.get('date_to')
+
+    if not operator:
+        return jsonify({'error': 'Operator is required'}), 400
+
+    try:
+        stats_service = CalibrationStatisticsService()
+        csv_content = stats_service.export_statistics_csv(operator, date_from, date_to)
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f'calibration_statistics_{timestamp}.csv'
+
+        return send_file(
+            io.BytesIO(csv_content.encode('utf-8-sig')),
+            mimetype='text/csv',
+            as_attachment=True,
+            download_name=filename
+        )
+    except StatisticsPermissionDeniedException as e:
+        return jsonify({
+            'error': e.message,
+            'required_role': e.required_role,
+            'operator_role': e.operator_role
+        }), 403
+    except Exception as e:
+        if '超过限制' in str(e):
+            return jsonify({'error': str(e)}), 400
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/config/statistics', methods=['GET'])
+def get_statistics_config():
+    config_service = ConfigService()
+    return jsonify(config_service.get_statistics_config())
+
+
+@app.route('/api/config/statistics', methods=['PUT'])
+def update_statistics_config():
+    data = request.json
+
+    if not data or not isinstance(data, dict):
+        return jsonify({'error': 'Request body must be a JSON object'}), 400
+
+    config_service = ConfigService()
+    updated = {}
+
+    for key, value in data.items():
+        updated[key] = config_service.set_statistics_config(key, value)
+
+    return jsonify({
+        'message': 'Statistics config updated',
+        'updated': updated
+    })
+
 
 if __name__ == '__main__':
     with app.app_context():

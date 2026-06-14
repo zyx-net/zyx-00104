@@ -1147,3 +1147,124 @@ curl -X POST http://localhost:5000/api/tasks/1/complete -d '{"operator": "Superv
 | 创建任务 | ✗ | ✗ | ✓ |
 | 接单/开始 | ✓ | ✓ | ✓ |
 | 完成/关闭 | ✗ | ✗ | ✓ |
+
+## 校准统计看板模块
+
+### 功能概述
+
+校准统计看板模块提供全局校准数据和任务负载的统计分析，支持以下特性：
+
+- **概览卡片**：到期预警数、本月新增证书、待复核/待批准数、完成率
+- **设备覆盖率**：按设备类型分组展示校准覆盖率
+- **任务负载**：各校准员任务分布和完成情况
+- **权限区分**：主管看全局，计量员只能看自己复核的证书和任务
+- **审计日志**：所有统计查询记录审计日志
+- **CSV导出**：主管可导出当前统计为CSV文件
+
+### API 端点
+
+#### 获取统计看板数据
+
+```bash
+curl "http://localhost:5000/api/statistics?operator=Supervisor1"
+```
+
+响应示例：
+
+```json
+{
+  "overview": {
+    "expiring_warning_count": 2,
+    "new_this_month": 5,
+    "pending_review": 3,
+    "pending_approve": 1,
+    "completion_rate": 85.5,
+    "total_certificates": 100,
+    "warning_days": 60
+  },
+  "equipment_coverage": [
+    {
+      "model_spec": "FLUKE-87V",
+      "certificate_count": 45,
+      "equipment_count": 12,
+      "coverage_rate": 75.0
+    }
+  ],
+  "calibrator_workload": [
+    {
+      "calibrator": "Zhang San",
+      "total_tasks": 10,
+      "pending_tasks": 3,
+      "completed_tasks": 7,
+      "completion_rate": 70.0
+    }
+  ],
+  "filter": {
+    "date_from": "2026-03-16",
+    "date_to": "2026-06-14",
+    "role": "supervisor"
+  }
+}
+```
+
+#### 自定义时间范围
+
+```bash
+curl "http://localhost:5000/api/statistics?operator=Supervisor1&date_from=2026-01-01&date_to=2026-06-30"
+```
+
+#### 导出统计为CSV
+
+```bash
+curl "http://localhost:5000/api/statistics/export?operator=Supervisor1" -o statistics.csv
+```
+
+#### 统计配置管理
+
+```bash
+curl http://localhost:5000/api/config/statistics
+```
+
+响应示例：
+
+```json
+{
+  "export_max_size_mb": 10,
+  "default_time_range_days": 90,
+  "auto_reload": true,
+  "reload_interval_seconds": 5
+}
+```
+
+#### 更新统计配置
+
+```bash
+curl -X PUT http://localhost:5000/api/config/statistics \
+  -H "Content-Type: application/json" \
+  -d '{"export_max_size_mb": 20, "default_time_range_days": 180}'
+```
+
+### 权限控制
+
+| 操作 | 录入员 | 计量员 | 主管 |
+|------|--------|--------|------|
+| 查看统计 | ✗ | ✓ (仅自己数据) | ✓ (全局) |
+| 导出统计 | ✗ | ✗ | ✓ |
+
+### 配置项 (config.json)
+
+```json
+{
+  "statistics": {
+    "export_max_size_mb": 10,
+    "default_time_range_days": 90,
+    "auto_reload": true,
+    "reload_interval_seconds": 5
+  }
+}
+```
+
+- `export_max_size_mb`: 导出CSV文件大小上限（MB）
+- `default_time_range_days`: 默认统计时间范围（天）
+- `auto_reload`: 是否启用配置文件热加载
+- `reload_interval_seconds`: 热加载检查间隔（秒）
