@@ -1510,3 +1510,495 @@ def test_batch_operations_no_rollback_on_failure(client, sample_equipment):
     cert0_response = client.get(f'/api/certificates/{cert_ids[0]}')
     cert0_data = json.loads(cert0_response.data)
     assert cert0_data['workflow_status'] == 'approved'
+
+
+def test_expiry_process_expired_yesterday(client, sample_equipment):
+    """测试昨天过期的证书自动流转"""
+    with app.app_context():
+        yesterday = datetime.now().date() - __import__('datetime').timedelta(days=1)
+        cert = Certificate(
+            cert_no='CERT-EXPIRED-YESTERDAY',
+            batch_id='BATCH-EXPIRY-YESTERDAY',
+            equipment_id=sample_equipment,
+            calibration_date=datetime(2025, 1, 1).date(),
+            valid_until=yesterday,
+            range_min=0,
+            range_max=100,
+            unit='V',
+            deviation=0.02,
+            workflow_status='approved'
+        )
+        db.session.add(cert)
+        db.session.commit()
+        cert_id = cert.id
+
+    response = client.post('/api/certificates/expiry-process')
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    assert data['processed'] >= 1
+
+    cert_response = client.get(f'/api/certificates/{cert_id}')
+    cert_data = json.loads(cert_response.data)
+    assert cert_data['workflow_status'] in ['limited', 'stopped']
+    assert cert_data['released_by'] == 'SYSTEM_AUTO_EXPIRY'
+
+
+def test_expiry_process_expired_today_not_processed(client, sample_equipment):
+    """测试今天过期的证书不会被自动流转（只有过了valid_until才处理）"""
+    with app.app_context():
+        today = datetime.now().date()
+        cert = Certificate(
+            cert_no='CERT-EXPIRED-TODAY',
+            batch_id='BATCH-EXPIRY-TODAY',
+            equipment_id=sample_equipment,
+            calibration_date=datetime(2025, 1, 1).date(),
+            valid_until=today,
+            range_min=0,
+            range_max=100,
+            unit='V',
+            deviation=0.02,
+            workflow_status='approved'
+        )
+        db.session.add(cert)
+        db.session.commit()
+        cert_id = cert.id
+
+    response = client.post('/api/certificates/expiry-process')
+    assert response.status_code == 200
+
+    cert_response = client.get(f'/api/certificates/{cert_id}')
+    cert_data = json.loads(cert_response.data)
+    assert cert_data['workflow_status'] == 'approved'
+
+
+def test_expiry_process_not_expired(client, sample_equipment):
+    """测试未过期证书不会被自动流转"""
+    with app.app_context():
+        from datetime import timedelta
+        future_date = datetime.now().date() + timedelta(days=30)
+        cert = Certificate(
+            cert_no='CERT-NOT-EXPIRED',
+            batch_id='BATCH-NOT-EXPIRED',
+            equipment_id=sample_equipment,
+            calibration_date=datetime(2026, 1, 1).date(),
+            valid_until=future_date,
+            range_min=0,
+            range_max=100,
+            unit='V',
+            deviation=0.02,
+            workflow_status='approved'
+        )
+        db.session.add(cert)
+        db.session.commit()
+        cert_id = cert.id
+
+    response = client.post('/api/certificates/expiry-process')
+    assert response.status_code == 200
+    data = json.loads(response.data)
+
+    cert_response = client.get(f'/api/certificates/{cert_id}')
+    cert_data = json.loads(cert_response.data)
+    assert cert_data['workflow_status'] == 'approved'
+
+
+def test_expiry_process_limited_vs_stopped(client):
+    """测试过期流转时根据偏差判断limited还是stopped"""
+    with app.app_context():
+        eq_limited = Equipment(
+            equipment_no='EQ-LIMITED-TEST',
+            equipment_name='Test Equipment Limited',
+            range_min=0,
+            range_max=100,
+            unit='V',
+            tolerance=0.05
+        )
+        eq_stopped = Equipment(
+            equipment_no='EQ-STOPPED-TEST',
+            equipment_name='Test Equipment Stopped',
+            range_min=0,
+            range_max=100,
+            unit='V',
+            tolerance=0.01
+        )
+        db.session.add_all([eq_limited, eq_stopped])
+        db.session.flush()
+
+        yesterday = datetime.now().date() - __import__('datetime').timedelta(days=1)
+
+        cert_limited = Certificate(
+            cert_no='CERT-TO-LIMITED',
+            batch_id='BATCH-LIMITED',
+            equipment_id=eq_limited.id,
+            calibration_date=datetime(2025, 1, 1).date(),
+            valid_until=yesterday,
+            range_min=0,
+            range_max=100,
+            unit='V',
+            deviation=0.03,
+            workflow_status='approved'
+        )
+        cert_stopped = Certificate(
+            cert_no='CERT-TO-STOPPED',
+            batch_id='BATCH-STOPPED',
+            equipment_id=eq_stopped.id,
+            calibration_date=datetime(2025, 1, 1).date(),
+            valid_until=yesterday,
+            range_min=0,
+            range_max=100,
+            unit='V',
+            deviation=0.05,
+            workflow_status='approved'
+        )
+        db.session.add_all([cert_limited, cert_stopped])
+        db.session.commit()
+        cert_limited_id = cert_limited.id
+        cert_stopped_id = cert_stopped.id
+
+    response = client.post('/api/certificates/expiry-process')
+    assert response.status_code == 200
+    data = json.loads(response.data)
+
+    cert_limited_resp = client.get(f'/api/certificates/{cert_limited_id}')
+    cert_limited_data = json.loads(cert_limited_resp.data)
+    assert cert_limited_data['workflow_status'] == 'limited'
+
+    cert_stopped_resp = client.get(f'/api/certificates/{cert_stopped_id}')
+    cert_stopped_data = json.loads(cert_stopped_resp.data)
+    assert cert_stopped_data['workflow_status'] == 'stopped'
+
+
+def test_expiry_process_equipment_status_update(client):
+    """测试设备下所有证书stopped后设备状态更新"""
+    with app.app_context():
+        equipment = Equipment(
+            equipment_no='EQ-ALL-STOPPED',
+            equipment_name='Test Equipment All Stopped',
+            range_min=0,
+            range_max=100,
+            unit='V',
+            tolerance=0.01,
+            status='active'
+        )
+        db.session.add(equipment)
+        db.session.flush()
+        eq_id = equipment.id
+
+        yesterday = datetime.now().date() - __import__('datetime').timedelta(days=1)
+
+        cert1 = Certificate(
+            cert_no='CERT-ALL-STOP-1',
+            batch_id='BATCH-ALL-STOP',
+            equipment_id=eq_id,
+            calibration_date=datetime(2025, 1, 1).date(),
+            valid_until=yesterday,
+            range_min=0,
+            range_max=100,
+            unit='V',
+            deviation=0.05,
+            workflow_status='approved'
+        )
+        cert2 = Certificate(
+            cert_no='CERT-ALL-STOP-2',
+            batch_id='BATCH-ALL-STOP',
+            equipment_id=eq_id,
+            calibration_date=datetime(2025, 1, 1).date(),
+            valid_until=yesterday,
+            range_min=0,
+            range_max=100,
+            unit='V',
+            deviation=0.05,
+            workflow_status='approved'
+        )
+        db.session.add_all([cert1, cert2])
+        db.session.commit()
+
+    response = client.post('/api/certificates/expiry-process')
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    assert data['equipment_updated'] >= 1
+
+    eq_response = client.get(f'/api/equipment/{eq_id}')
+    eq_data = json.loads(eq_response.data)
+    assert eq_data['status'] == 'stopped'
+
+
+def test_expiry_process_audit_log(client, sample_equipment):
+    """测试过期流转记录审计日志"""
+    with app.app_context():
+        yesterday = datetime.now().date() - __import__('datetime').timedelta(days=1)
+        cert = Certificate(
+            cert_no='CERT-AUDIT-EXPIRY',
+            batch_id='BATCH-AUDIT-EXPIRY',
+            equipment_id=sample_equipment,
+            calibration_date=datetime(2025, 1, 1).date(),
+            valid_until=yesterday,
+            range_min=0,
+            range_max=100,
+            unit='V',
+            deviation=0.05,
+            workflow_status='approved'
+        )
+        db.session.add(cert)
+        db.session.commit()
+        cert_id = cert.id
+
+    response = client.post('/api/certificates/expiry-process')
+    assert response.status_code == 200
+
+    audit_response = client.get(f'/api/audit?certificate_id={cert_id}')
+    audit_data = json.loads(audit_response.data)
+
+    expiry_logs = [log for log in audit_data if log['action'] == 'auto_expiry_transition']
+    assert len(expiry_logs) == 1
+    assert expiry_logs[0]['operator'] == 'SYSTEM_AUTO_EXPIRY'
+    assert 'auto-transitioned' in expiry_logs[0]['notes'].lower()
+    assert expiry_logs[0]['previous_state'] == 'approved'
+
+
+def test_search_empty_result(client):
+    """测试搜索无结果"""
+    response = client.get('/api/certificates/search?cert_no=NONEXISTENT')
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    assert data['total'] == 0
+    assert data['items'] == []
+    assert data['pages'] == 0
+
+
+def test_search_pagination(client, sample_equipment):
+    """测试搜索分页"""
+    with app.app_context():
+        for i in range(25):
+            cert = Certificate(
+                cert_no=f'CERT-PAGE-{i:03d}',
+                batch_id='BATCH-PAGINATION',
+                equipment_id=sample_equipment,
+                calibration_date=datetime(2026, 1, 1).date(),
+                valid_until=datetime(2027, 1, 1).date(),
+                range_min=0,
+                range_max=100,
+                unit='V',
+                deviation=0.02
+            )
+            db.session.add(cert)
+        db.session.commit()
+
+    response = client.get('/api/certificates/search?page=1&per_page=10')
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    assert len(data['items']) == 10
+    assert data['page'] == 1
+    assert data['per_page'] == 10
+    assert data['has_next'] == True
+    assert data['has_prev'] == False
+
+    response2 = client.get('/api/certificates/search?page=2&per_page=10')
+    data2 = json.loads(response2.data)
+    assert data2['page'] == 2
+    assert data2['has_prev'] == True
+
+
+def test_search_pagination_out_of_bounds(client, sample_equipment):
+    """测试分页越界返回空结果"""
+    with app.app_context():
+        cert = Certificate(
+            cert_no='CERT-PAGE-BOUND',
+            batch_id='BATCH-BOUND',
+            equipment_id=sample_equipment,
+            calibration_date=datetime(2026, 1, 1).date(),
+            valid_until=datetime(2027, 1, 1).date(),
+            range_min=0,
+            range_max=100,
+            unit='V',
+            deviation=0.02
+        )
+        db.session.add(cert)
+        db.session.commit()
+
+    response = client.get('/api/certificates/search?page=999&per_page=10')
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    assert data['items'] == []
+    assert data['total'] == 1
+    assert data['page'] == 999
+
+
+def test_search_combined_filters(client, sample_equipment):
+    """测试组合条件搜索"""
+    with app.app_context():
+        equipment = Equipment(
+            equipment_no='EQ-SEARCH-TEST',
+            equipment_name='Search Test Equipment',
+            range_min=0,
+            range_max=100,
+            unit='V',
+            tolerance=0.05
+        )
+        db.session.add(equipment)
+        db.session.flush()
+        eq_id = equipment.id
+
+        cert = Certificate(
+            cert_no='CERT-SEARCH-001',
+            batch_id='BATCH-SEARCH-TEST',
+            equipment_id=eq_id,
+            calibration_date=datetime(2026, 3, 15).date(),
+            valid_until=datetime(2027, 3, 15).date(),
+            range_min=0,
+            range_max=100,
+            unit='V',
+            deviation=0.02,
+            workflow_status='released',
+            entered_by='Operator1',
+            reviewed_by='Metrologist1',
+            approved_by='Supervisor1',
+            released_by='Operator2'
+        )
+        db.session.add(cert)
+        db.session.commit()
+        cert_id = cert.id
+
+    response = client.get('/api/certificates/search?cert_no=SEARCH-001&workflow_status=released&equipment_no=EQ-SEARCH&batch_id=SEARCH-TEST&operator=Operator1')
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    assert data['total'] == 1
+    assert data['items'][0]['cert_no'] == 'CERT-SEARCH-001'
+
+
+def test_search_by_calibration_date_range(client, sample_equipment):
+    """测试按校准日期范围搜索"""
+    with app.app_context():
+        cert1 = Certificate(
+            cert_no='CERT-DATE-RANGE-1',
+            batch_id='BATCH-DATE-RANGE',
+            equipment_id=sample_equipment,
+            calibration_date=datetime(2026, 1, 15).date(),
+            valid_until=datetime(2027, 1, 15).date(),
+            range_min=0,
+            range_max=100,
+            unit='V',
+            deviation=0.02
+        )
+        cert2 = Certificate(
+            cert_no='CERT-DATE-RANGE-2',
+            batch_id='BATCH-DATE-RANGE',
+            equipment_id=sample_equipment,
+            calibration_date=datetime(2026, 3, 15).date(),
+            valid_until=datetime(2027, 3, 15).date(),
+            range_min=0,
+            range_max=100,
+            unit='V',
+            deviation=0.02
+        )
+        db.session.add_all([cert1, cert2])
+        db.session.commit()
+
+    response = client.get('/api/certificates/search?calibration_date_from=2026-02-01&calibration_date_to=2026-04-01')
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    assert data['total'] == 1
+    assert data['items'][0]['cert_no'] == 'CERT-DATE-RANGE-2'
+
+
+def test_search_sort_by_valid_until(client, sample_equipment):
+    """测试按到期日排序"""
+    with app.app_context():
+        cert1 = Certificate(
+            cert_no='CERT-SORT-1',
+            batch_id='BATCH-SORT',
+            equipment_id=sample_equipment,
+            calibration_date=datetime(2026, 1, 1).date(),
+            valid_until=datetime(2026, 6, 1).date(),
+            range_min=0,
+            range_max=100,
+            unit='V',
+            deviation=0.02
+        )
+        cert2 = Certificate(
+            cert_no='CERT-SORT-2',
+            batch_id='BATCH-SORT',
+            equipment_id=sample_equipment,
+            calibration_date=datetime(2026, 1, 1).date(),
+            valid_until=datetime(2026, 3, 1).date(),
+            range_min=0,
+            range_max=100,
+            unit='V',
+            deviation=0.02
+        )
+        db.session.add_all([cert1, cert2])
+        db.session.commit()
+
+    response = client.get('/api/certificates/search?sort_by=valid_until&sort_order=asc')
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    if data['total'] >= 2:
+        first_valid = data['items'][0]['valid_until']
+        second_valid = data['items'][1]['valid_until']
+        assert first_valid <= second_valid
+
+    response_desc = client.get('/api/certificates/search?sort_by=valid_until&sort_order=desc')
+    data_desc = json.loads(response_desc.data)
+    if data_desc['total'] >= 2:
+        first_valid_desc = data_desc['items'][0]['valid_until']
+        second_valid_desc = data_desc['items'][1]['valid_until']
+        assert first_valid_desc >= second_valid_desc
+
+
+def test_search_no_sensitive_fields(client, sample_equipment):
+    """测试搜索结果不暴露敏感字段"""
+    with app.app_context():
+        cert = Certificate(
+            cert_no='CERT-NO-SENSITIVE',
+            batch_id='BATCH-NO-SENSITIVE',
+            equipment_id=sample_equipment,
+            calibration_date=datetime(2026, 1, 1).date(),
+            valid_until=datetime(2027, 1, 1).date(),
+            range_min=0,
+            range_max=100,
+            unit='V',
+            deviation=0.02,
+            cert_file='SECRET_FILE_PATH'
+        )
+        db.session.add(cert)
+        db.session.commit()
+
+    response = client.get('/api/certificates/search?cert_no=NO-SENSITIVE')
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    assert data['total'] == 1
+    
+    item = data['items'][0]
+    assert 'cert_file' not in item or item.get('cert_file') is None
+
+
+def test_search_empty_params_returns_all(client, sample_equipment):
+    """测试空条件查询返回全部"""
+    with app.app_context():
+        for i in range(3):
+            cert = Certificate(
+                cert_no=f'CERT-EMPTY-{i}',
+                batch_id='BATCH-EMPTY',
+                equipment_id=sample_equipment,
+                calibration_date=datetime(2026, 1, 1).date(),
+                valid_until=datetime(2027, 1, 1).date(),
+                range_min=0,
+                range_max=100,
+                unit='V',
+                deviation=0.02
+            )
+            db.session.add(cert)
+        db.session.commit()
+
+    response = client.get('/api/certificates/search')
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    assert data['total'] >= 3
+
+
+def test_search_invalid_pagination_params(client):
+    """测试无效分页参数自动修正"""
+    response = client.get('/api/certificates/search?page=-1&per_page=200')
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    assert data['page'] == 1
+    assert data['per_page'] == 20

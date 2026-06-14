@@ -216,6 +216,215 @@ curl -X POST http://localhost:5000/api/certificates/1/stop \
   }'
 ```
 
+### 过期预警
+
+#### 获取即将过期的证书
+```bash
+curl http://localhost:5000/api/certificates/expiry-warning
+```
+
+#### 自定义预警天数
+```bash
+curl "http://localhost:5000/api/certificates/expiry-warning?days=7"
+```
+
+响应示例：
+```json
+{
+  "warning_days_used": 30,
+  "count": 2,
+  "certificates": [
+    {
+      "id": 1,
+      "cert_no": "CERT-2024-001",
+      "valid_until": "2024-06-20",
+      "workflow_status": "released",
+      ...
+    }
+  ]
+}
+```
+
+### 过期自动流转
+
+#### 触发过期证书自动处理
+```bash
+curl -X POST http://localhost:5000/api/certificates/expiry-process
+```
+
+响应示例：
+```json
+{
+  "processed": 3,
+  "limited": 1,
+  "stopped": 2,
+  "equipment_updated": 1,
+  "details": [
+    {
+      "certificate_id": 1,
+      "cert_no": "CERT-2024-001",
+      "previous_status": "approved",
+      "new_status": "limited",
+      "valid_until": "2024-06-13"
+    },
+    {
+      "certificate_id": 2,
+      "cert_no": "CERT-2024-002",
+      "previous_status": "approved",
+      "new_status": "stopped",
+      "valid_until": "2024-06-10"
+    }
+  ]
+}
+```
+
+#### 过期流转规则
+- **触发条件**：证书 `valid_until` < 当前日期，且状态为 `draft`/`entered`/`reviewed`/`approved`
+- **状态判断**：
+  - 偏差 ≤ 设备容忍度 → `limited`（限用）
+  - 偏差 > 设备容忍度 → `stopped`（停用）
+- **设备联动**：设备下所有证书都 `stopped` 时，设备状态自动更新为 `stopped`
+- **审计日志**：所有流转记录操作人为 `SYSTEM_AUTO_EXPIRY`，便于与人工操作区分
+
+### 证书搜索
+
+#### 基础搜索（返回所有证书，分页）
+```bash
+curl "http://localhost:5000/api/certificates/search"
+```
+
+#### 按证书编号模糊搜索
+```bash
+curl "http://localhost:5000/api/certificates/search?cert_no=CERT-2024"
+```
+
+#### 按工作流状态筛选
+```bash
+curl "http://localhost:5000/api/certificates/search?workflow_status=released"
+```
+
+#### 按设备编号筛选
+```bash
+curl "http://localhost:5000/api/certificates/search?equipment_no=EQ-2024-001"
+```
+
+#### 按批次筛选
+```bash
+curl "http://localhost:5000/api/certificates/search?batch_id=BATCH-2024-001"
+```
+
+#### 按校准日期范围筛选
+```bash
+curl "http://localhost:5000/api/certificates/search?calibration_date_from=2024-01-01&calibration_date_to=2024-06-30"
+```
+
+#### 按操作人筛选（匹配录入/复核/批准/放行人）
+```bash
+curl "http://localhost:5000/api/certificates/search?operator=Zhang"
+```
+
+#### 组合条件搜索
+```bash
+curl "http://localhost:5000/api/certificates/search?workflow_status=released&equipment_no=EQ-2024&calibration_date_from=2024-01-01"
+```
+
+#### 分页参数
+```bash
+curl "http://localhost:5000/api/certificates/search?page=2&per_page=10"
+```
+
+#### 排序参数
+```bash
+# 按到期日升序（默认）
+curl "http://localhost:5000/api/certificates/search?sort_by=valid_until&sort_order=asc"
+
+# 按到期日降序
+curl "http://localhost:5000/api/certificates/search?sort_by=valid_until&sort_order=desc"
+
+# 按校准日期排序
+curl "http://localhost:5000/api/certificates/search?sort_by=calibration_date&sort_order=desc"
+```
+
+#### 搜索响应示例
+```json
+{
+  "items": [
+    {
+      "id": 1,
+      "cert_no": "CERT-2024-001",
+      "batch_id": "BATCH-2024-001",
+      "equipment_id": 1,
+      "equipment_no": "EQ-2024-001",
+      "equipment_name": "Digital Multimeter",
+      "calibration_date": "2024-06-01",
+      "valid_until": "2025-06-01",
+      "range_min": 0,
+      "range_max": 1000,
+      "unit": "V",
+      "deviation": 0.02,
+      "calibrator": "Zhang San",
+      "workflow_status": "released",
+      "entered_by": "Operator1",
+      "reviewed_by": "Metrologist1",
+      "approved_by": "Supervisor1",
+      "released_by": "Operator2",
+      "version": 4,
+      "created_at": "2024-06-01T10:00:00",
+      "updated_at": "2024-06-01T12:00:00"
+    }
+  ],
+  "total": 25,
+  "page": 1,
+  "per_page": 20,
+  "pages": 2,
+  "has_next": true,
+  "has_prev": false
+}
+```
+
+#### 搜索特点
+- **安全字段**：只返回安全字段，不暴露 `cert_file` 等敏感信息
+- **分页越界**：页码超出范围时返回空列表，不报错
+- **参数修正**：无效分页参数自动修正（负数页码→1，超大每页数→20）
+- **模糊匹配**：证书编号、设备编号、批次号、操作人均支持模糊匹配
+
+### 批次统计
+
+#### 获取批次统计信息
+```bash
+curl http://localhost:5000/api/batches/stats
+```
+
+响应示例：
+```json
+{
+  "BATCH-2024-001": {
+    "total": 10,
+    "draft": 2,
+    "released": 5,
+    "approved": 3
+  },
+  "BATCH-2024-002": {
+    "total": 5,
+    "released": 5
+  }
+}
+```
+
+### 配置管理
+
+#### 获取过期预警天数配置
+```bash
+curl http://localhost:5000/api/config/expiry-warning-days
+```
+
+#### 设置过期预警天数
+```bash
+curl -X PUT http://localhost:5000/api/config/expiry-warning-days \
+  -H "Content-Type: application/json" \
+  -d '{"days": 60}'
+```
+
 ### 审计日志
 
 #### 查看所有审计记录

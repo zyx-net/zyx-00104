@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from models import db, Equipment, Certificate, AuditLog, WorkflowStatus
-from services import CertificateImportService, WorkflowService, ExportService, ExpiryWarningService, BatchStatsService, ConfigService, BatchWorkflowService, RevertService
+from services import CertificateImportService, WorkflowService, ExportService, ExpiryWarningService, BatchStatsService, ConfigService, BatchWorkflowService, RevertService, ExpiryAutoTransitionService, CertificateSearchService
 from validators import parse_csv_to_json
 import os
 import json
@@ -471,6 +471,62 @@ def set_expiry_warning_days():
     config_service = ConfigService()
     config_service.set_expiry_warning_days(days)
     return jsonify({'expiry_warning_days': days})
+
+@app.route('/api/certificates/expiry-process', methods=['POST'])
+def process_expiry():
+    expiry_service = ExpiryAutoTransitionService()
+    try:
+        results = expiry_service.process_expired_certificates()
+        return jsonify(results)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/certificates/search', methods=['GET'])
+def search_certificates():
+    cert_no = request.args.get('cert_no')
+    workflow_status = request.args.get('workflow_status')
+    equipment_no = request.args.get('equipment_no')
+    batch_id = request.args.get('batch_id')
+    calibration_date_from = request.args.get('calibration_date_from')
+    calibration_date_to = request.args.get('calibration_date_to')
+    operator = request.args.get('operator')
+    
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 20, type=int)
+    sort_by = request.args.get('sort_by', 'valid_until')
+    sort_order = request.args.get('sort_order', 'asc')
+
+    if page < 1:
+        page = 1
+    if per_page < 1 or per_page > 100:
+        per_page = 20
+
+    filters = {}
+    if cert_no:
+        filters['cert_no'] = cert_no
+    if workflow_status:
+        filters['workflow_status'] = workflow_status
+    if equipment_no:
+        filters['equipment_no'] = equipment_no
+    if batch_id:
+        filters['batch_id'] = batch_id
+    if calibration_date_from:
+        filters['calibration_date_from'] = calibration_date_from
+    if calibration_date_to:
+        filters['calibration_date_to'] = calibration_date_to
+    if operator:
+        filters['operator'] = operator
+
+    search_service = CertificateSearchService()
+    results = search_service.search(
+        filters=filters if filters else None,
+        page=page,
+        per_page=per_page,
+        sort_by=sort_by,
+        sort_order=sort_order
+    )
+
+    return jsonify(results)
 
 @app.errorhandler(404)
 def not_found(e):

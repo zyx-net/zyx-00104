@@ -512,6 +512,223 @@ class RevertService:
             return False, [{'error': str(e)}]
 
 
+class ExpiryAutoTransitionService:
+    SYSTEM_OPERATOR = 'SYSTEM_AUTO_EXPIRY'
+
+    def process_expired_certificates(self):
+        today = date.today()
+        
+        expired_certs = Certificate.query.filter(
+            Certificate.valid_until < today,
+            Certificate.workflow_status.in_([
+                WorkflowStatus.DRAFT.value,
+                WorkflowStatus.ENTERED.value,
+                WorkflowStatus.REVIEWED.value,
+                WorkflowStatus.APPROVED.value
+            ])
+        ).all()
+
+        results = {
+            'processed': 0,
+            'limited': 0,
+            'stopped': 0,
+            'equipment_updated': 0,
+            'details': []
+        }
+
+        for cert in expired_certs:
+            new_status = self._determine_expiry_status(cert)
+            
+            previous_status = cert.workflow_status
+            cert.workflow_status = new_status.value
+            cert.version += 1
+            cert.updated_at = datetime.utcnow()
+            cert.released_by = self.SYSTEM_OPERATOR
+            cert.released_at = datetime.utcnow()
+
+            audit = AuditLog(
+                operator=self.SYSTEM_OPERATOR,
+                action='auto_expiry_transition',
+                resource_type='certificate',
+                resource_id=cert.id,
+                certificate_id=cert.id,
+                batch_id=cert.batch_id,
+                notes=f'Certificate auto-transitioned to {new_status.value} due to expiry (valid_until: {cert.valid_until})',
+                decision_basis='System automatic expiry processing',
+                version=cert.version,
+                previous_state=previous_status,
+                new_state=new_status.value
+            )
+            db.session.add(audit)
+
+            results['processed'] += 1
+            if new_status == WorkflowStatus.LIMITED:
+                results['limited'] += 1
+            else:
+                results['stopped'] += 1
+
+            results['details'].append({
+                'certificate_id': cert.id,
+                'cert_no': cert.cert_no,
+                'previous_status': previous_status,
+                'new_status': new_status.value,
+                'valid_until': cert.valid_until.isoformat()
+            })
+
+        db.session.flush()
+        
+        equipment_updates = self._update_equipment_status()
+        results['equipment_updated'] = equipment_updates
+
+        try:
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            raise e
+
+        return results
+
+    def _determine_expiry_status(self, cert):
+        equipment = cert.equipment
+        if equipment and equipment.tolerance:
+            if cert.deviation <= equipment.tolerance:
+                return WorkflowStatus.LIMITED
+            else:
+                return WorkflowStatus.STOPPED
+        return WorkflowStatus.STOPPED
+
+    def _update_equipment_status(self):
+        updated_count = 0
+        equipment_ids = db.session.query(Certificate.equipment_id).filter(
+            Certificate.workflow_status == WorkflowStatus.STOPPED.value
+        ).distinct().all()
+        
+        for (eq_id,) in equipment_ids:
+            equipment = Equipment.query.get(eq_id)
+            if not equipment:
+                continue
+
+            all_certs = Certificate.query.filter_by(equipment_id=eq_id).all()
+            if not all_certs:
+                continue
+
+            all_stopped = all(
+                c.workflow_status == WorkflowStatus.STOPPED.value 
+                for c in all_certs
+            )
+
+            if all_stopped and equipment.status != 'stopped':
+                previous_status = equipment.status
+                equipment.status = 'stopped'
+                equipment.updated_at = datetime.utcnow()
+
+                audit = AuditLog(
+                    operator=self.SYSTEM_OPERATOR,
+                    action='auto_expiry_equipment_stop',
+                    resource_type='equipment',
+                    resource_id=equipment.id,
+                    equipment_id=equipment.id,
+                    notes='Equipment auto-stopped due to all certificates expired and stopped',
+                    decision_basis='System automatic expiry processing',
+                    previous_state=previous_status,
+                    new_state='stopped'
+                )
+                db.session.add(audit)
+                updated_count += 1
+
+        return updated_count
+
+
+class CertificateSearchService:
+    SAFE_FIELDS = [
+        'id', 'cert_no', 'batch_id', 'equipment_id', 'equipment_no', 'equipment_name',
+        'calibration_date', 'valid_until', 'range_min', 'range_max', 'unit',
+        'deviation', 'calibrator', 'workflow_status',
+        'entered_by', 'entered_at', 'reviewed_by', 'reviewed_at',
+        'approved_by', 'approved_at', 'released_by', 'released_at',
+        'version', 'created_at', 'updated_at'
+    ]
+
+    def search(self, filters=None, page=1, per_page=20, sort_by='valid_until', sort_order='asc'):
+        query = Certificate.query.join(Equipment, Certificate.equipment_id == Equipment.id)
+
+        if filters:
+            query = self._apply_filters(query, filters)
+
+        if sort_by == 'valid_until':
+            query = query.order_by(
+                Certificate.valid_until.asc() if sort_order == 'asc' else Certificate.valid_until.desc()
+            )
+        elif sort_by == 'calibration_date':
+            query = query.order_by(
+                Certificate.calibration_date.asc() if sort_order == 'asc' else Certificate.calibration_date.desc()
+            )
+        elif sort_by == 'created_at':
+            query = query.order_by(
+                Certificate.created_at.asc() if sort_order == 'asc' else Certificate.created_at.desc()
+            )
+        else:
+            query = query.order_by(Certificate.valid_until.asc())
+
+        pagination = query.paginate(page=page, per_page=per_page, error_out=False)
+
+        return {
+            'items': [self._to_safe_dict(cert) for cert in pagination.items],
+            'total': pagination.total,
+            'page': page,
+            'per_page': per_page,
+            'pages': pagination.pages,
+            'has_next': pagination.has_next,
+            'has_prev': pagination.has_prev
+        }
+
+    def _apply_filters(self, query, filters):
+        if filters.get('cert_no'):
+            query = query.filter(Certificate.cert_no.ilike(f"%{filters['cert_no']}%"))
+
+        if filters.get('workflow_status'):
+            query = query.filter(Certificate.workflow_status == filters['workflow_status'])
+
+        if filters.get('equipment_no'):
+            query = query.filter(Equipment.equipment_no.ilike(f"%{filters['equipment_no']}%"))
+
+        if filters.get('batch_id'):
+            query = query.filter(Certificate.batch_id.ilike(f"%{filters['batch_id']}%"))
+
+        if filters.get('calibration_date_from'):
+            from dateutil import parser
+            try:
+                date_from = parser.parse(filters['calibration_date_from']).date()
+                query = query.filter(Certificate.calibration_date >= date_from)
+            except:
+                pass
+
+        if filters.get('calibration_date_to'):
+            from dateutil import parser
+            try:
+                date_to = parser.parse(filters['calibration_date_to']).date()
+                query = query.filter(Certificate.calibration_date <= date_to)
+            except:
+                pass
+
+        if filters.get('operator'):
+            operator = filters['operator']
+            query = query.filter(
+                db.or_(
+                    Certificate.entered_by.ilike(f"%{operator}%"),
+                    Certificate.reviewed_by.ilike(f"%{operator}%"),
+                    Certificate.approved_by.ilike(f"%{operator}%"),
+                    Certificate.released_by.ilike(f"%{operator}%")
+                )
+            )
+
+        return query
+
+    def _to_safe_dict(self, cert):
+        full_dict = cert.to_dict()
+        return {k: v for k, v in full_dict.items() if k in self.SAFE_FIELDS}
+
+
 class ExportService:
     def export_by_equipment(self, equipment_id, format='json', valid_from=None, valid_to=None):
         query = Certificate.query.filter_by(equipment_id=equipment_id)
