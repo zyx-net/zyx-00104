@@ -23,6 +23,11 @@ class DeviceStatus(Enum):
     LIMITED = "limited"
     STOPPED = "stopped"
 
+class ReportStatus(Enum):
+    GENERATED = "generated"
+    REVOKED = "revoked"
+    OVERWRITTEN = "overwritten"
+
 class Equipment(db.Model):
     __tablename__ = 'equipment'
 
@@ -186,4 +191,78 @@ class AuditLog(db.Model):
             'reverted_at': self.reverted_at.isoformat() if self.reverted_at else None,
             'revert_log_id': self.revert_log_id,
             'denied_reason': self.denied_reason
+        }
+
+class Report(db.Model):
+    __tablename__ = 'reports'
+
+    id = db.Column(db.Integer, primary_key=True)
+    report_no = db.Column(db.String(100), nullable=False, index=True)
+    certificate_id = db.Column(db.Integer, db.ForeignKey('certificates.id'), nullable=False)
+    equipment_no = db.Column(db.String(100), nullable=False, index=True)
+    calibration_date = db.Column(db.Date, nullable=False)
+    file_path = db.Column(db.String(500), nullable=False)
+    file_name = db.Column(db.String(200), nullable=False)
+    status = db.Column(db.String(20), default=ReportStatus.GENERATED.value)
+    decision_result = db.Column(db.String(50))
+    standard_uncertainty = db.Column(db.Float)
+    expanded_uncertainty = db.Column(db.Float)
+    coverage_factor = db.Column(db.Float)
+    generated_by = db.Column(db.String(100), nullable=False)
+    generated_at = db.Column(db.DateTime, default=datetime.utcnow)
+    version = db.Column(db.Integer, default=1)
+    previous_version = db.Column(db.Integer)
+    revoked = db.Column(db.Boolean, default=False)
+    revoked_by = db.Column(db.String(100))
+    revoked_at = db.Column(db.DateTime)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    certificate = db.relationship('Certificate', backref='reports')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'report_no': self.report_no,
+            'certificate_id': self.certificate_id,
+            'equipment_no': self.equipment_no,
+            'calibration_date': self.calibration_date.isoformat() if self.calibration_date else None,
+            'file_path': self.file_path,
+            'file_name': self.file_name,
+            'status': self.status,
+            'decision_result': self.decision_result,
+            'standard_uncertainty': self.standard_uncertainty,
+            'expanded_uncertainty': self.expanded_uncertainty,
+            'coverage_factor': self.coverage_factor,
+            'generated_by': self.generated_by,
+            'generated_at': self.generated_at.isoformat() if self.generated_at else None,
+            'version': self.version,
+            'previous_version': self.previous_version,
+            'revoked': self.revoked,
+            'revoked_by': self.revoked_by,
+            'revoked_at': self.revoked_at.isoformat() if self.revoked_at else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
+class ReportTemplate(db.Model):
+    __tablename__ = 'report_templates'
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False, unique=True)
+    description = db.Column(db.Text)
+    template_content = db.Column(db.Text, nullable=False)
+    is_default = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'name': self.name,
+            'description': self.description,
+            'template_content': self.template_content,
+            'is_default': self.is_default,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
         }

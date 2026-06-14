@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-from models import db, Equipment, Certificate, AuditLog, WorkflowStatus
-from services import CertificateImportService, WorkflowService, ExportService, ExpiryWarningService, BatchStatsService, ConfigService, BatchWorkflowService, RevertService, ExpiryAutoTransitionService, CertificateSearchService, RolePermissionService, UserService, PermissionDeniedException, ExpiryCheckConflictException, ScheduledTaskService
+from models import db, Equipment, Certificate, AuditLog, WorkflowStatus, Report, ReportStatus
+from services import CertificateImportService, WorkflowService, ExportService, ExpiryWarningService, BatchStatsService, ConfigService, BatchWorkflowService, RevertService, ExpiryAutoTransitionService, CertificateSearchService, RolePermissionService, UserService, PermissionDeniedException, ExpiryCheckConflictException, ScheduledTaskService, ReportService, ReportGenerationConflictException, CertificateLockedException
 from validators import parse_csv_to_json
 import os
 import json
@@ -609,6 +609,153 @@ def list_audit_logs():
 
     logs = query.order_by(AuditLog.timestamp.desc()).all()
     return jsonify([log.to_dict() for log in logs])
+
+@app.route('/api/reports/preview/<int:certificate_id>', methods=['POST'])
+def preview_report(certificate_id):
+    data = request.json
+    operator = data.get('operator')
+    
+    if not operator:
+        return jsonify({'error': 'Operator is required'}), 400
+    
+    report_service = ReportService()
+    
+    try:
+        result, error = report_service.preview_report(certificate_id, operator)
+        
+        if error:
+            return jsonify(error), 400
+        
+        return jsonify(result)
+    except PermissionDeniedException as e:
+        return jsonify({
+            'error': e.message,
+            'required_role': e.required_role,
+            'operator_role': e.operator_role
+        }), 403
+
+@app.route('/api/reports/generate/<int:certificate_id>', methods=['POST'])
+def generate_report(certificate_id):
+    data = request.json
+    operator = data.get('operator')
+    force_overwrite = data.get('force_overwrite', False)
+    
+    if not operator:
+        return jsonify({'error': 'Operator is required'}), 400
+    
+    report_service = ReportService()
+    
+    try:
+        result, error = report_service.generate_report(certificate_id, operator, force_overwrite)
+        
+        if error:
+            return jsonify(error), 400
+        
+        return jsonify(result), 201
+    except ReportGenerationConflictException as e:
+        return jsonify({
+            'error': e.message,
+            'conflict': True,
+            'existing_version': e.existing_report.version,
+            'message': 'Report already exists. Use force_overwrite=true to overwrite.'
+        }), 409
+    except PermissionDeniedException as e:
+        return jsonify({
+            'error': e.message,
+            'required_role': e.required_role,
+            'operator_role': e.operator_role
+        }), 403
+
+@app.route('/api/reports/batch/generate', methods=['POST'])
+def batch_generate_reports():
+    data = request.json
+    certificate_ids = data.get('certificate_ids', [])
+    operator = data.get('operator')
+    
+    if not operator:
+        return jsonify({'error': 'Operator is required'}), 400
+    
+    if not certificate_ids or not isinstance(certificate_ids, list):
+        return jsonify({'error': 'certificate_ids must be a non-empty list'}), 400
+    
+    report_service = ReportService()
+    
+    try:
+        result = report_service.batch_generate_reports(certificate_ids, operator)
+        return jsonify(result)
+    except CertificateLockedException as e:
+        return jsonify({
+            'error': e.message,
+            'locked_certificates': e.certificate_ids
+        }), 409
+    except PermissionDeniedException as e:
+        return jsonify({
+            'error': e.message,
+            'required_role': e.required_role,
+            'operator_role': e.operator_role
+        }), 403
+
+@app.route('/api/reports', methods=['GET'])
+def search_reports():
+    equipment_no = request.args.get('equipment_no')
+    certificate_id = request.args.get('certificate_id')
+    status = request.args.get('status')
+    calibration_date_from = request.args.get('calibration_date_from')
+    calibration_date_to = request.args.get('calibration_date_to')
+    generated_by = request.args.get('generated_by')
+    
+    filters = {}
+    if equipment_no:
+        filters['equipment_no'] = equipment_no
+    if certificate_id:
+        filters['certificate_id'] = int(certificate_id)
+    if status:
+        filters['status'] = status
+    if calibration_date_from:
+        filters['calibration_date_from'] = calibration_date_from
+    if calibration_date_to:
+        filters['calibration_date_to'] = calibration_date_to
+    if generated_by:
+        filters['generated_by'] = generated_by
+    
+    report_service = ReportService()
+    reports = report_service.search_reports(filters if filters else None)
+    
+    return jsonify(reports)
+
+@app.route('/api/reports/<int:report_id>', methods=['GET'])
+def get_report(report_id):
+    report_service = ReportService()
+    report = report_service.get_report_by_id(report_id)
+    
+    if not report:
+        return jsonify({'error': 'Report not found'}), 404
+    
+    return jsonify(report.to_dict())
+
+@app.route('/api/reports/<int:report_id>/revoke', methods=['POST'])
+def revoke_report(report_id):
+    data = request.json
+    operator = data.get('operator')
+    
+    if not operator:
+        return jsonify({'error': 'Operator is required'}), 400
+    
+    report_service = ReportService()
+    
+    try:
+        result, error = report_service.revoke_report(report_id, operator)
+        
+        if error:
+            return jsonify(error), 400
+        
+        return jsonify(result)
+    except PermissionDeniedException as e:
+        return jsonify({
+            'error': e.message,
+            'required_role': e.required_role,
+            'operator_role': e.operator_role
+        }), 403
 
 @app.errorhandler(404)
 def not_found(e):

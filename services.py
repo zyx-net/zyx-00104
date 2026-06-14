@@ -1,4 +1,4 @@
-from models import db, Certificate, Equipment, AuditLog, WorkflowStatus, User, UserRole
+from models import db, Certificate, Equipment, AuditLog, WorkflowStatus, User, UserRole, Report, ReportStatus
 from validators import CertificateValidator, CertificateImportSchema, parse_csv_to_json
 from marshmallow import ValidationError
 from datetime import datetime, timedelta, date
@@ -131,13 +131,24 @@ class UserService:
 
 
 class ConfigService:
+    _config = None
+    _config_mtime = 0
+    _auto_reload_thread = None
+    _stop_event = None
+
     def __init__(self):
-        self._config = None
+        if self._config is None:
+            self._load_config()
+            self._start_auto_reload()
 
     def _load_config(self):
         if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                self._config = json.load(f)
+            try:
+                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    self._config = json.load(f)
+                self._config_mtime = os.path.getmtime(CONFIG_FILE)
+            except Exception as e:
+                pass
         else:
             self._config = {'expiry_warning_days': 30, 'expiry_check_interval_hours': 24}
             self._save_config()
@@ -146,56 +157,83 @@ class ConfigService:
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(self._config, f, indent=2)
 
+    def _start_auto_reload(self):
+        if self._auto_reload_thread is not None and self._auto_reload_thread.is_alive():
+            return
+
+        self._stop_event = None
+        
+        def monitor_config():
+            import time
+            while True:
+                try:
+                    if os.path.exists(CONFIG_FILE):
+                        current_mtime = os.path.getmtime(CONFIG_FILE)
+                        if current_mtime != self._config_mtime:
+                            self._load_config()
+                    time.sleep(self.get_reload_interval_seconds())
+                except Exception:
+                    time.sleep(1)
+
+        self._auto_reload_thread = __import__('threading').Thread(target=monitor_config, daemon=True)
+        self._auto_reload_thread.start()
+
+    def _check_reload(self):
+        if os.path.exists(CONFIG_FILE):
+            current_mtime = os.path.getmtime(CONFIG_FILE)
+            if current_mtime != self._config_mtime:
+                self._load_config()
+
     def get_expiry_warning_days(self):
-        if self._config is None:
-            self._load_config()
+        self._check_reload()
         return self._config.get('expiry_warning_days', 30)
 
     def set_expiry_warning_days(self, days):
-        if self._config is None:
-            self._load_config()
+        self._check_reload()
         self._config['expiry_warning_days'] = days
         self._save_config()
         return days
 
     def get_expiry_check_interval_hours(self):
-        if self._config is None:
-            self._load_config()
+        self._check_reload()
         return self._config.get('expiry_check_interval_hours', 24)
 
     def set_expiry_check_interval_hours(self, hours):
-        if self._config is None:
-            self._load_config()
+        self._check_reload()
         self._config['expiry_check_interval_hours'] = hours
         self._save_config()
         return hours
 
     def get_last_expiry_check_time(self):
-        if self._config is None:
-            self._load_config()
+        self._check_reload()
         return self._config.get('last_expiry_check_time')
 
     def set_last_expiry_check_time(self, timestamp):
-        if self._config is None:
-            self._load_config()
+        self._check_reload()
         self._config['last_expiry_check_time'] = timestamp
         self._save_config()
 
     def get_expiry_check_in_progress(self):
-        if self._config is None:
-            self._load_config()
+        self._check_reload()
         return self._config.get('expiry_check_in_progress', False)
 
     def set_expiry_check_in_progress(self, in_progress):
-        if self._config is None:
-            self._load_config()
+        self._check_reload()
         self._config['expiry_check_in_progress'] = in_progress
         self._save_config()
 
     def get_config(self):
-        if self._config is None:
-            self._load_config()
+        self._check_reload()
         return self._config.copy()
+
+    def get_report_config(self):
+        self._check_reload()
+        return self._config.get('report', {})
+
+    def get_reload_interval_seconds(self):
+        self._check_reload()
+        report_config = self._config.get('report', {})
+        return report_config.get('reload_interval_seconds', 5)
 
 class ExpiryWarningService:
     def get_expiring_certificates(self, days=None):
@@ -1065,3 +1103,418 @@ class ScheduledTaskService:
             'check_interval_hours': ConfigService().get_expiry_check_interval_hours(),
             'check_in_progress': ConfigService().get_expiry_check_in_progress()
         }
+
+
+class ReportGenerationConflictException(Exception):
+    def __init__(self, message, existing_report):
+        self.message = message
+        self.existing_report = existing_report
+        super().__init__(self.message)
+
+
+class CertificateLockedException(Exception):
+    def __init__(self, message, certificate_ids):
+        self.message = message
+        self.certificate_ids = certificate_ids
+        super().__init__(self.message)
+
+
+class ReportService:
+    REQUIRED_ROLE_FOR_GENERATION = UserRole.SUPERVISOR.value
+    REQUIRED_ROLE_FOR_PREVIEW = [UserRole.SUPERVISOR.value, UserRole.METROLOGIST.value]
+
+    def __init__(self):
+        self._lock_cache = {}
+
+    def _get_report_config(self, force_reload=False):
+        config_service = ConfigService()
+        return config_service.get_report_config()
+
+    def _get_storage_path(self):
+        config = self._get_report_config()
+        path = config.get('storage_path', './reports')
+        os.makedirs(path, exist_ok=True)
+        return os.path.abspath(path)
+
+    def _determine_decision_result(self, certificate):
+        config = self._get_report_config()
+        decision_rules = config.get('decision_rules', {})
+        
+        deviation = certificate.deviation
+        tolerance = certificate.equipment.tolerance if certificate.equipment else 0
+        
+        if deviation <= tolerance:
+            return decision_rules.get('qualified', {}).get('description', '合格')
+        elif deviation > tolerance * 2:
+            return decision_rules.get('unqualified', {}).get('description', '不合格')
+        else:
+            return decision_rules.get('limited', {}).get('description', '限用')
+
+    def _generate_report_no(self, certificate):
+        return f"RPT-{certificate.equipment.equipment_no}-{certificate.calibration_date.strftime('%Y%m%d')}"
+
+    def _generate_file_name(self, certificate, version=1):
+        equipment_no = certificate.equipment.equipment_no
+        date_str = certificate.calibration_date.strftime('%Y%m%d')
+        if version > 1:
+            return f"{equipment_no}_{date_str}_v{version}.json"
+        return f"{equipment_no}_{date_str}.json"
+
+    def _generate_report_content(self, certificate, operator, decision_result):
+        config = self._get_report_config()
+        template = config.get('template', {})
+        
+        report_data = {
+            'report_no': self._generate_report_no(certificate),
+            'header': template.get('header', '校准证书报告'),
+            'certificate': certificate.to_dict(),
+            'equipment': certificate.equipment.to_dict() if certificate.equipment else {},
+            'decision_result': decision_result,
+            'uncertainty': {
+                'standard_uncertainty': None,
+                'expanded_uncertainty': None,
+                'coverage_factor': None
+            },
+            'generated_by': operator,
+            'generated_at': datetime.utcnow().isoformat(),
+            'footer': template.get('footer', '计量校准中心')
+        }
+        
+        return json.dumps(report_data, indent=2, ensure_ascii=False)
+
+    def _check_certificate_locked(self, certificate_id):
+        return self._lock_cache.get(certificate_id, False)
+
+    def _lock_certificates(self, certificate_ids):
+        for cert_id in certificate_ids:
+            self._lock_cache[cert_id] = True
+
+    def _unlock_certificates(self, certificate_ids):
+        for cert_id in certificate_ids:
+            self._lock_cache.pop(cert_id, None)
+
+    def check_generation_permission(self, operator):
+        role = RolePermissionService.get_user_role(operator)
+        if role != self.REQUIRED_ROLE_FOR_GENERATION:
+            denied_reason = f"Report generation requires supervisor role, but user has: {role}"
+            audit = AuditLog(
+                operator=operator,
+                action='permission_denied',
+                resource_type='report',
+                notes=denied_reason,
+                denied_reason=denied_reason
+            )
+            db.session.add(audit)
+            db.session.commit()
+            raise PermissionDeniedException(
+                message=denied_reason,
+                required_role=[self.REQUIRED_ROLE_FOR_GENERATION],
+                operator_role=role,
+                action='generate_report',
+                resource_type='report'
+            )
+        return True
+
+    def check_preview_permission(self, operator):
+        role = RolePermissionService.get_user_role(operator)
+        if role not in self.REQUIRED_ROLE_FOR_PREVIEW:
+            denied_reason = f"Report preview requires supervisor or metrologist role, but user has: {role}"
+            raise PermissionDeniedException(
+                message=denied_reason,
+                required_role=self.REQUIRED_ROLE_FOR_PREVIEW,
+                operator_role=role,
+                action='preview_report',
+                resource_type='report'
+            )
+        return True
+
+    def get_existing_report(self, certificate_id):
+        return Report.query.filter(
+            Report.certificate_id == certificate_id,
+            Report.revoked == False
+        ).order_by(Report.version.desc()).first()
+
+    def has_conflict(self, certificate_id):
+        existing = self.get_existing_report(certificate_id)
+        return existing is not None
+
+    def preview_report(self, certificate_id, operator):
+        self.check_preview_permission(operator)
+        
+        certificate = Certificate.query.get(certificate_id)
+        if not certificate:
+            return None, {'error': 'Certificate not found'}
+        
+        if certificate.workflow_status not in [
+            WorkflowStatus.APPROVED.value,
+            WorkflowStatus.RELEASED.value,
+            WorkflowStatus.LIMITED.value
+        ]:
+            return None, {'error': 'Certificate must be approved or released to generate report'}
+        
+        decision_result = self._determine_decision_result(certificate)
+        content = self._generate_report_content(certificate, operator, decision_result)
+        
+        existing_report = self.get_existing_report(certificate_id)
+        
+        return {
+            'preview': json.loads(content),
+            'has_existing_report': existing_report is not None,
+            'existing_version': existing_report.version if existing_report else None,
+            'certificate_status': certificate.workflow_status
+        }, None
+
+    def generate_report(self, certificate_id, operator, force_overwrite=False, skip_lock_check=False):
+        self.check_generation_permission(operator)
+        
+        certificate = Certificate.query.get(certificate_id)
+        if not certificate:
+            return None, {'error': 'Certificate not found'}
+        
+        if certificate.workflow_status not in [
+            WorkflowStatus.APPROVED.value,
+            WorkflowStatus.RELEASED.value,
+            WorkflowStatus.LIMITED.value
+        ]:
+            return None, {'error': 'Certificate must be approved or released to generate report'}
+        
+        if not skip_lock_check and self._check_certificate_locked(certificate_id):
+            return None, {'error': 'Certificate is locked by another operation'}
+        
+        existing_report = self.get_existing_report(certificate_id)
+        
+        if existing_report and not force_overwrite:
+            raise ReportGenerationConflictException(
+                message=f"Report already exists for certificate {certificate_id}. Version: {existing_report.version}",
+                existing_report=existing_report
+            )
+        
+        decision_result = self._determine_decision_result(certificate)
+        
+        if existing_report:
+            new_version = existing_report.version + 1
+            
+            existing_report.status = ReportStatus.OVERWRITTEN.value
+            existing_report.revoked = True
+            existing_report.revoked_by = operator
+            existing_report.revoked_at = datetime.utcnow()
+            
+            audit = AuditLog(
+                operator=operator,
+                action='report_overwrite',
+                resource_type='report',
+                resource_id=existing_report.id,
+                certificate_id=certificate_id,
+                equipment_id=certificate.equipment_id,
+                notes=f"Report version {existing_report.version} overwritten by version {new_version}",
+                decision_basis='Report regeneration requested',
+                version=new_version,
+                previous_state=json.dumps({
+                    'report_id': existing_report.id,
+                    'version': existing_report.version,
+                    'status': existing_report.status
+                }),
+                new_state=f"version:{new_version},status:{ReportStatus.GENERATED.value}"
+            )
+            db.session.add(audit)
+        else:
+            new_version = 1
+        
+        file_name = self._generate_file_name(certificate, new_version)
+        file_path = os.path.join(self._get_storage_path(), file_name)
+        
+        content = self._generate_report_content(certificate, operator, decision_result)
+        
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        
+        report = Report(
+            report_no=self._generate_report_no(certificate),
+            certificate_id=certificate_id,
+            equipment_no=certificate.equipment.equipment_no,
+            calibration_date=certificate.calibration_date,
+            file_path=file_path,
+            file_name=file_name,
+            status=ReportStatus.GENERATED.value,
+            decision_result=decision_result,
+            generated_by=operator,
+            generated_at=datetime.utcnow(),
+            version=new_version,
+            previous_version=existing_report.version if existing_report else None
+        )
+        
+        db.session.add(report)
+        
+        generation_audit = AuditLog(
+            operator=operator,
+            action='report_generate',
+            resource_type='report',
+            resource_id=report.id if report.id else 0,
+            certificate_id=certificate_id,
+            equipment_id=certificate.equipment_id,
+            notes=f"Report generated: {file_name}",
+            decision_basis='Report generation requested',
+            version=new_version,
+            new_state=ReportStatus.GENERATED.value
+        )
+        db.session.add(generation_audit)
+        
+        db.session.flush()
+        generation_audit.resource_id = report.id
+        
+        db.session.commit()
+        
+        return report.to_dict(), None
+
+    def batch_generate_reports(self, certificate_ids, operator):
+        self.check_generation_permission(operator)
+        
+        locked_certs = [cid for cid in certificate_ids if self._check_certificate_locked(cid)]
+        if locked_certs:
+            raise CertificateLockedException(
+                message=f"Some certificates are locked: {locked_certs}",
+                certificate_ids=locked_certs
+            )
+        
+        self._lock_certificates(certificate_ids)
+        
+        results = {
+            'total': len(certificate_ids),
+            'successful': 0,
+            'failed': 0,
+            'results': [],
+            'batch_id': str(uuid.uuid4())
+        }
+        
+        try:
+            for cert_id in certificate_ids:
+                certificate = Certificate.query.get(cert_id)
+                
+                if not certificate:
+                    results['failed'] += 1
+                    results['results'].append({
+                        'certificate_id': cert_id,
+                        'success': False,
+                        'errors': ['Certificate not found']
+                    })
+                    continue
+                
+                if certificate.workflow_status not in [
+                    WorkflowStatus.APPROVED.value,
+                    WorkflowStatus.RELEASED.value,
+                    WorkflowStatus.LIMITED.value
+                ]:
+                    results['failed'] += 1
+                    results['results'].append({
+                        'certificate_id': cert_id,
+                        'cert_no': certificate.cert_no,
+                        'success': False,
+                        'errors': ['Certificate must be approved or released']
+                    })
+                    continue
+                
+                try:
+                    report_data, error = self.generate_report(cert_id, operator, force_overwrite=True, skip_lock_check=True)
+                    if error:
+                        results['failed'] += 1
+                        results['results'].append({
+                            'certificate_id': cert_id,
+                            'cert_no': certificate.cert_no,
+                            'success': False,
+                            'errors': [error.get('error', 'Unknown error')]
+                        })
+                    else:
+                        results['successful'] += 1
+                        results['results'].append({
+                            'certificate_id': cert_id,
+                            'cert_no': certificate.cert_no,
+                            'success': True,
+                            'report_id': report_data['id'],
+                            'report_no': report_data['report_no'],
+                            'version': report_data['version']
+                        })
+                except Exception as e:
+                    results['failed'] += 1
+                    results['results'].append({
+                        'certificate_id': cert_id,
+                        'cert_no': certificate.cert_no,
+                        'success': False,
+                        'errors': [str(e)]
+                    })
+            
+            return results
+        
+        finally:
+            self._unlock_certificates(certificate_ids)
+
+    def search_reports(self, filters=None):
+        query = Report.query
+        
+        if filters:
+            if filters.get('equipment_no'):
+                query = query.filter(Report.equipment_no.ilike(f"%{filters['equipment_no']}%"))
+            
+            if filters.get('certificate_id'):
+                query = query.filter(Report.certificate_id == filters['certificate_id'])
+            
+            if filters.get('status'):
+                query = query.filter(Report.status == filters['status'])
+            
+            if filters.get('calibration_date_from'):
+                from dateutil import parser
+                try:
+                    date_from = parser.parse(filters['calibration_date_from']).date()
+                    query = query.filter(Report.calibration_date >= date_from)
+                except:
+                    pass
+            
+            if filters.get('calibration_date_to'):
+                from dateutil import parser
+                try:
+                    date_to = parser.parse(filters['calibration_date_to']).date()
+                    query = query.filter(Report.calibration_date <= date_to)
+                except:
+                    pass
+            
+            if filters.get('generated_by'):
+                query = query.filter(Report.generated_by.ilike(f"%{filters['generated_by']}%"))
+        
+        reports = query.order_by(Report.generated_at.desc()).all()
+        return [report.to_dict() for report in reports]
+
+    def get_report_by_id(self, report_id):
+        return Report.query.get(report_id)
+
+    def revoke_report(self, report_id, operator):
+        self.check_generation_permission(operator)
+        
+        report = Report.query.get(report_id)
+        if not report:
+            return None, {'error': 'Report not found'}
+        
+        if report.revoked:
+            return None, {'error': 'Report is already revoked'}
+        
+        report.revoked = True
+        report.revoked_by = operator
+        report.revoked_at = datetime.utcnow()
+        report.status = ReportStatus.REVOKED.value
+        
+        audit = AuditLog(
+            operator=operator,
+            action='report_revoke',
+            resource_type='report',
+            resource_id=report.id,
+            certificate_id=report.certificate_id,
+            equipment_id=report.equipment_no,
+            notes=f"Report revoked: {report.report_no}",
+            decision_basis='Report revocation requested',
+            version=report.version,
+            previous_state=ReportStatus.GENERATED.value,
+            new_state=ReportStatus.REVOKED.value
+        )
+        db.session.add(audit)
+        
+        db.session.commit()
+        
+        return report.to_dict(), None

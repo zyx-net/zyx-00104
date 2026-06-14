@@ -12,6 +12,8 @@ def client():
     app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
 
     with app.app_context():
+        db.session.remove()
+        db.drop_all()
         db.create_all()
         operator1 = User(username='Operator1', role='operator')
         operator2 = User(username='Operator2', role='operator')
@@ -2012,3 +2014,399 @@ def test_search_invalid_pagination_params(client):
     data = json.loads(response.data)
     assert data['page'] == 1
     assert data['per_page'] == 20
+
+
+def setup_certificate_for_report(client):
+    """辅助函数：设置可生成报告的证书（已批准）"""
+    with app.app_context():
+        equipment = Equipment(
+            equipment_no='EQ-REPORT-TEST',
+            equipment_name='Report Test Equipment',
+            range_min=0,
+            range_max=100,
+            unit='V',
+            tolerance=0.05
+        )
+        db.session.add(equipment)
+        db.session.flush()
+        
+        cert = Certificate(
+            cert_no='CERT-REPORT-TEST',
+            batch_id='BATCH-REPORT-TEST',
+            equipment_id=equipment.id,
+            calibration_date=datetime(2026, 6, 1).date(),
+            valid_until=datetime(2027, 6, 1).date(),
+            range_min=0,
+            range_max=100,
+            unit='V',
+            deviation=0.02,
+            workflow_status='approved'
+        )
+        db.session.add(cert)
+        db.session.commit()
+        return cert.id
+
+
+def test_report_generate_permission_denied_for_operator(client):
+    """测试录入员无法生成报告（403）"""
+    cert_id = setup_certificate_for_report(client)
+    
+    response = client.post(f'/api/reports/generate/{cert_id}',
+        data=json.dumps({'operator': 'Operator1'}),
+        content_type='application/json'
+    )
+    assert response.status_code == 403
+    data = json.loads(response.data)
+    assert 'required_role' in data
+    assert data['required_role'] == ['supervisor']
+
+
+def test_report_generate_permission_denied_for_metrologist(client):
+    """测试计量员无法生成报告（403）"""
+    cert_id = setup_certificate_for_report(client)
+    
+    response = client.post(f'/api/reports/generate/{cert_id}',
+        data=json.dumps({'operator': 'Metrologist1'}),
+        content_type='application/json'
+    )
+    assert response.status_code == 403
+    data = json.loads(response.data)
+    assert 'required_role' in data
+
+
+def test_report_preview_allowed_for_metrologist(client):
+    """测试计量员可以预览报告"""
+    cert_id = setup_certificate_for_report(client)
+    
+    response = client.post(f'/api/reports/preview/{cert_id}',
+        data=json.dumps({'operator': 'Metrologist1'}),
+        content_type='application/json'
+    )
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    assert 'preview' in data
+    assert 'decision_result' in data['preview']
+
+
+def test_report_preview_denied_for_operator(client):
+    """测试录入员无法预览报告（403）"""
+    cert_id = setup_certificate_for_report(client)
+    
+    response = client.post(f'/api/reports/preview/{cert_id}',
+        data=json.dumps({'operator': 'Operator1'}),
+        content_type='application/json'
+    )
+    assert response.status_code == 403
+
+
+def test_report_generate_success(client):
+    """测试主管成功生成报告"""
+    cert_id = setup_certificate_for_report(client)
+    
+    response = client.post(f'/api/reports/generate/{cert_id}',
+        data=json.dumps({'operator': 'Supervisor1'}),
+        content_type='application/json'
+    )
+    assert response.status_code == 201
+    data = json.loads(response.data)
+    assert 'report_no' in data
+    assert 'file_path' in data
+    assert 'decision_result' in data
+    assert data['version'] == 1
+    
+    assert os.path.exists(data['file_path']), "Report file should be created"
+
+
+def test_report_generate_conflict(client):
+    """测试重复生成报告冲突（未强制覆盖）"""
+    cert_id = setup_certificate_for_report(client)
+    
+    response1 = client.post(f'/api/reports/generate/{cert_id}',
+        data=json.dumps({'operator': 'Supervisor1'}),
+        content_type='application/json'
+    )
+    assert response1.status_code == 201
+    
+    response2 = client.post(f'/api/reports/generate/{cert_id}',
+        data=json.dumps({'operator': 'Supervisor1'}),
+        content_type='application/json'
+    )
+    assert response2.status_code == 409
+    data = json.loads(response2.data)
+    assert data['conflict'] == True
+    assert 'existing_version' in data
+
+
+def test_report_generate_force_overwrite(client):
+    """测试强制覆盖生成报告"""
+    cert_id = setup_certificate_for_report(client)
+    
+    response1 = client.post(f'/api/reports/generate/{cert_id}',
+        data=json.dumps({'operator': 'Supervisor1'}),
+        content_type='application/json'
+    )
+    assert response1.status_code == 201
+    data1 = json.loads(response1.data)
+    version1 = data1['version']
+    
+    response2 = client.post(f'/api/reports/generate/{cert_id}',
+        data=json.dumps({'operator': 'Supervisor1', 'force_overwrite': True}),
+        content_type='application/json'
+    )
+    assert response2.status_code == 201
+    data2 = json.loads(response2.data)
+    assert data2['version'] == version1 + 1
+    assert data2['previous_version'] == version1
+
+
+def test_report_generate_audit_log(client):
+    """测试生成报告记录审计日志"""
+    cert_id = setup_certificate_for_report(client)
+    
+    response = client.post(f'/api/reports/generate/{cert_id}',
+        data=json.dumps({'operator': 'Supervisor1'}),
+        content_type='application/json'
+    )
+    assert response.status_code == 201
+    
+    audit_response = client.get(f'/api/audit?certificate_id={cert_id}')
+    audit_data = json.loads(audit_response.data)
+    
+    generate_logs = [log for log in audit_data if log['action'] == 'report_generate']
+    assert len(generate_logs) == 1
+    assert generate_logs[0]['operator'] == 'Supervisor1'
+
+
+def test_report_overwrite_audit_log(client):
+    """测试覆盖报告记录审计日志（包含版本信息）"""
+    cert_id = setup_certificate_for_report(client)
+    
+    client.post(f'/api/reports/generate/{cert_id}',
+        data=json.dumps({'operator': 'Supervisor1'}),
+        content_type='application/json'
+    )
+    
+    client.post(f'/api/reports/generate/{cert_id}',
+        data=json.dumps({'operator': 'Supervisor1', 'force_overwrite': True}),
+        content_type='application/json'
+    )
+    
+    audit_response = client.get(f'/api/audit?certificate_id={cert_id}')
+    audit_data = json.loads(audit_response.data)
+    
+    overwrite_logs = [log for log in audit_data if log['action'] == 'report_overwrite']
+    assert len(overwrite_logs) == 1
+    assert 'version' in overwrite_logs[0]
+    assert 'previous_state' in overwrite_logs[0]
+    assert 'new_state' in overwrite_logs[0]
+
+
+def test_report_search(client):
+    """测试报告搜索功能"""
+    cert_id = setup_certificate_for_report(client)
+    
+    client.post(f'/api/reports/generate/{cert_id}',
+        data=json.dumps({'operator': 'Supervisor1'}),
+        content_type='application/json'
+    )
+    
+    response = client.get('/api/reports?equipment_no=EQ-REPORT-TEST')
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    assert len(data) >= 1
+    assert any(r['equipment_no'] == 'EQ-REPORT-TEST' for r in data)
+
+
+def test_report_search_by_date_range(client):
+    """测试按日期范围搜索报告"""
+    cert_id = setup_certificate_for_report(client)
+    
+    client.post(f'/api/reports/generate/{cert_id}',
+        data=json.dumps({'operator': 'Supervisor1'}),
+        content_type='application/json'
+    )
+    
+    response = client.get('/api/reports?calibration_date_from=2026-06-01&calibration_date_to=2026-06-30')
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    assert len(data) >= 1
+
+
+def test_batch_generate_reports(client, sample_equipment):
+    """测试批量生成报告"""
+    cert_ids = []
+    with app.app_context():
+        for i in range(2):
+            cert = Certificate(
+                cert_no=f'CERT-BATCH-REPORT-{int(time.time())}-{i}',
+                batch_id='BATCH-REPORT-BATCH',
+                equipment_id=sample_equipment,
+                calibration_date=datetime(2026, 6, 1).date(),
+                valid_until=datetime(2027, 6, 1).date(),
+                range_min=0,
+                range_max=100,
+                unit='V',
+                deviation=0.02,
+                workflow_status='approved'
+            )
+            db.session.add(cert)
+            db.session.flush()
+            cert_ids.append(cert.id)
+        db.session.commit()
+    
+    response = client.post('/api/reports/batch/generate',
+        data=json.dumps({
+            'operator': 'Supervisor1',
+            'certificate_ids': cert_ids
+        }),
+        content_type='application/json'
+    )
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    assert data['total'] == 2
+    assert data['successful'] == 2
+    assert data['failed'] == 0
+
+
+def test_batch_generate_locks_and_releases(client, sample_equipment):
+    """测试批量生成期间锁定证书，完成后释放"""
+    cert_ids = []
+    with app.app_context():
+        for i in range(2):
+            cert = Certificate(
+                cert_no=f'CERT-BATCH-LOCK-{int(time.time())}-{i}',
+                batch_id='BATCH-LOCK-TEST',
+                equipment_id=sample_equipment,
+                calibration_date=datetime(2026, 6, 1).date(),
+                valid_until=datetime(2027, 6, 1).date(),
+                range_min=0,
+                range_max=100,
+                unit='V',
+                deviation=0.02,
+                workflow_status='approved'
+            )
+            db.session.add(cert)
+            db.session.flush()
+            cert_ids.append(cert.id)
+        db.session.commit()
+    
+    response = client.post('/api/reports/batch/generate',
+        data=json.dumps({
+            'operator': 'Supervisor1',
+            'certificate_ids': cert_ids
+        }),
+        content_type='application/json'
+    )
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    assert data['successful'] == 2
+    
+    response2 = client.post('/api/reports/batch/generate',
+        data=json.dumps({
+            'operator': 'Supervisor1',
+            'certificate_ids': cert_ids,
+            'force_overwrite': True
+        }),
+        content_type='application/json'
+    )
+    assert response2.status_code == 200
+    data2 = json.loads(response2.data)
+    assert data2['successful'] == 2
+
+
+def test_report_revoke(client):
+    """测试撤销报告"""
+    cert_id = setup_certificate_for_report(client)
+    
+    generate_response = client.post(f'/api/reports/generate/{cert_id}',
+        data=json.dumps({'operator': 'Supervisor1'}),
+        content_type='application/json'
+    )
+    assert generate_response.status_code == 201
+    report_data = json.loads(generate_response.data)
+    report_id = report_data['id']
+    
+    revoke_response = client.post(f'/api/reports/{report_id}/revoke',
+        data=json.dumps({'operator': 'Supervisor2'}),
+        content_type='application/json'
+    )
+    assert revoke_response.status_code == 200
+    revoked_data = json.loads(revoke_response.data)
+    assert revoked_data['revoked'] == True
+    assert revoked_data['status'] == 'revoked'
+
+
+def test_report_revoke_permission_denied(client):
+    """测试非主管无法撤销报告"""
+    cert_id = setup_certificate_for_report(client)
+    
+    generate_response = client.post(f'/api/reports/generate/{cert_id}',
+        data=json.dumps({'operator': 'Supervisor1'}),
+        content_type='application/json'
+    )
+    report_data = json.loads(generate_response.data)
+    report_id = report_data['id']
+    
+    revoke_response = client.post(f'/api/reports/{report_id}/revoke',
+        data=json.dumps({'operator': 'Operator1'}),
+        content_type='application/json'
+    )
+    assert revoke_response.status_code == 403
+
+
+def test_report_generate_creates_file(client):
+    """测试生成报告时创建实际文件"""
+    cert_id = setup_certificate_for_report(client)
+    
+    response = client.post(f'/api/reports/generate/{cert_id}',
+        data=json.dumps({'operator': 'Supervisor1'}),
+        content_type='application/json'
+    )
+    assert response.status_code == 201
+    data = json.loads(response.data)
+    
+    assert os.path.exists(data['file_path']), "Report file should exist"
+    
+    with open(data['file_path'], 'r', encoding='utf-8') as f:
+        file_content = json.load(f)
+        assert file_content['report_no'] == data['report_no']
+        assert file_content['decision_result'] == data['decision_result']
+
+
+def test_report_generate_not_approved_fails(client):
+    """测试未批准的证书无法生成报告"""
+    with app.app_context():
+        equipment = Equipment(
+            equipment_no='EQ-NOT-APPROVED',
+            equipment_name='Not Approved Equipment',
+            range_min=0,
+            range_max=100,
+            unit='V',
+            tolerance=0.05
+        )
+        db.session.add(equipment)
+        db.session.flush()
+        
+        cert = Certificate(
+            cert_no='CERT-NOT-APPROVED',
+            batch_id='BATCH-NOT-APPROVED',
+            equipment_id=equipment.id,
+            calibration_date=datetime(2026, 6, 1).date(),
+            valid_until=datetime(2027, 6, 1).date(),
+            range_min=0,
+            range_max=100,
+            unit='V',
+            deviation=0.02,
+            workflow_status='reviewed'
+        )
+        db.session.add(cert)
+        db.session.commit()
+        cert_id = cert.id
+    
+    response = client.post(f'/api/reports/generate/{cert_id}',
+        data=json.dumps({'operator': 'Supervisor1'}),
+        content_type='application/json'
+    )
+    assert response.status_code == 400
+    data = json.loads(response.data)
+    assert 'must be approved' in data['error'].lower()
