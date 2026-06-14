@@ -5,6 +5,8 @@ from services import AuditService, ConfigService
 from datetime import datetime, timedelta, timezone
 import json
 import os
+import threading
+import time
 
 
 @pytest.fixture
@@ -408,3 +410,168 @@ def test_audit_config_hot_reload(client):
         json.dump(original_config._config, f, indent=2)
     
     assert new_days == 30
+
+
+def test_audit_archive_hash_missing_fields():
+    """测试哈希计算遗漏字段 - 验证修改非哈希字段后check_hash仍然通过"""
+    with app.app_context():
+        cutoff_time = datetime.now(timezone.utc) - timedelta(days=90)
+        AuditArchive.query.delete()
+        AuditLog.query.filter(AuditLog.timestamp < cutoff_time).delete()
+        db.session.commit()
+
+        old_log = AuditLog(
+            timestamp=datetime.now(timezone.utc) - timedelta(days=100),
+            operator='Operator1',
+            action='import',
+            resource_type='certificate',
+            resource_id=555,
+            notes='Original notes',
+            decision_basis='Original decision basis',
+            details='Original details',
+            batch_id='BATCH-555',
+            previous_state='{"status": "pending"}',
+            new_state='{"status": "approved"}',
+            version=2,
+            reverted=False,
+            denied_reason=None
+        )
+        db.session.add(old_log)
+        db.session.commit()
+        log_id = old_log.id
+
+        archive_service = AuditService()
+        result = archive_service.archive_old_logs()
+        
+        assert result['success'] == True, f"Archive failed: {result}"
+        assert result['archived_count'] == 1
+
+        archived = AuditArchive.query.filter_by(audit_log_id=log_id).first()
+        assert archived is not None
+        expected_hash = archive_service._calculate_record_hash(old_log)
+        assert archived.check_hash == expected_hash
+
+        archived.notes = 'Modified notes after archive'
+        archived.decision_basis = 'Modified decision basis after archive'
+        archived.details = 'Modified details after archive'
+        archived.batch_id = 'BATCH-MODIFIED'
+        archived.previous_state = '{"status": "modified"}'
+        archived.new_state = '{"status": "modified_new"}'
+        db.session.commit()
+
+        reloaded_archived = AuditArchive.query.filter_by(audit_log_id=log_id).first()
+        recalculated_hash = archive_service._calculate_record_hash(old_log)
+        
+        assert reloaded_archived.check_hash == recalculated_hash
+        assert reloaded_archived.notes == 'Modified notes after archive'
+        assert reloaded_archived.decision_basis == 'Modified decision basis after archive'
+
+
+def test_audit_archive_concurrent_execution():
+    """测试并发归档 - 验证同时执行两次archive_old_logs会导致数据丢失或重复归档"""
+    with app.app_context():
+        cutoff_time = datetime.now(timezone.utc) - timedelta(days=90)
+        AuditArchive.query.delete()
+        AuditLog.query.filter(AuditLog.timestamp < cutoff_time).delete()
+        db.session.commit()
+
+        for i in range(10):
+            old_log = AuditLog(
+                timestamp=datetime.now(timezone.utc) - timedelta(days=100 + i),
+                operator=f'Operator{i}',
+                action='import',
+                resource_type='certificate',
+                resource_id=1000 + i,
+                notes=f'Test concurrent log {i}'
+            )
+            db.session.add(old_log)
+        db.session.commit()
+        
+        log_ids = [log.id for log in AuditLog.query.filter(AuditLog.timestamp < cutoff_time).all()]
+        initial_count = len(log_ids)
+        assert initial_count == 10
+
+    results = []
+    exceptions = []
+
+    def run_archive():
+        with app.app_context():
+            try:
+                archive_service = AuditService()
+                result = archive_service.archive_old_logs()
+                results.append(result)
+            except Exception as e:
+                exceptions.append(e)
+
+    t1 = threading.Thread(target=run_archive)
+    t2 = threading.Thread(target=run_archive)
+    
+    t1.start()
+    t2.start()
+    
+    t1.join()
+    t2.join()
+
+    with app.app_context():
+        final_audit_log_count = AuditLog.query.filter(AuditLog.id.in_(log_ids)).count()
+        final_archive_count = AuditArchive.query.filter(AuditArchive.audit_log_id.in_(log_ids)).count()
+
+        archived_ids = [a.audit_log_id for a in AuditArchive.query.filter(AuditArchive.audit_log_id.in_(log_ids)).all()]
+        duplicate_count = len(archived_ids) - len(set(archived_ids))
+
+        assert final_audit_log_count > 0 or duplicate_count > 0, \
+            f"Concurrent execution should cause data loss or duplicates. " \
+            f"Remaining logs: {final_audit_log_count}, Duplicates: {duplicate_count}"
+
+
+def test_audit_archive_second_commit_failure():
+    """测试第二个commit失败 - 验证delete后写审计日志失败时数据丢失"""
+    with app.app_context():
+        cutoff_time = datetime.now(timezone.utc) - timedelta(days=90)
+        AuditArchive.query.delete()
+        AuditLog.query.filter(AuditLog.timestamp < cutoff_time).delete()
+        db.session.commit()
+
+        old_log = AuditLog(
+            timestamp=datetime.now(timezone.utc) - timedelta(days=100),
+            operator='Operator1',
+            action='import',
+            resource_type='certificate',
+            resource_id=9999,
+            notes='Test second commit failure'
+        )
+        db.session.add(old_log)
+        db.session.commit()
+        log_id = old_log.id
+
+        original_count = AuditLog.query.filter_by(id=log_id).count()
+        assert original_count == 1
+
+        archive_service = AuditService()
+
+        original_add = db.session.add
+        add_count = [0]
+        should_fail = [False]
+        
+        def mock_add(obj):
+            add_count[0] += 1
+            if add_count[0] >= 2:
+                should_fail[0] = True
+                raise Exception("Simulated second commit failure - disk full")
+            original_add(obj)
+        
+        db.session.add = mock_add
+        
+        try:
+            result = archive_service.archive_old_logs()
+        except Exception:
+            pass
+        
+        db.session.add = original_add
+
+        remaining_log_count = AuditLog.query.filter_by(id=log_id).count()
+        archive_count = AuditArchive.query.filter_by(audit_log_id=log_id).count()
+
+        assert should_fail[0] == True, "Second commit should have been triggered"
+        assert remaining_log_count == 0, f"Expected 0 remaining audit logs after delete+first commit, got {remaining_log_count}"
+        assert archive_count == 1, f"Expected 1 archived record, got {archive_count}"
