@@ -658,3 +658,102 @@ def test_export_equipment_json(client, sample_equipment):
     assert isinstance(data, list)
     assert len(data) >= 1
     assert data[0]['equipment_no'] == 'EQ-TEST-001'
+
+def test_import_certificate_array_format(client, sample_equipment):
+    """测试数组格式导入证书（按 README 方式）"""
+    response = client.post('/api/certificates/import',
+        data=json.dumps([
+            {
+                'cert_no': f'CERT-ARRAY-{int(time.time())}-1',
+                'equipment_no': 'EQ-TEST-001',
+                'calibration_date': '2026-01-01',
+                'valid_until': '2027-01-01',
+                'range_min': 0,
+                'range_max': 100,
+                'unit': 'V',
+                'deviation': 0.02,
+                'calibrator': 'Zhang San'
+            },
+            {
+                'cert_no': f'CERT-ARRAY-{int(time.time())}-2',
+                'equipment_no': 'EQ-TEST-001',
+                'calibration_date': '2026-01-02',
+                'valid_until': '2027-01-02',
+                'range_min': 0,
+                'range_max': 100,
+                'unit': 'V',
+                'deviation': 0.03,
+                'calibrator': 'Li Si'
+            }
+        ]),
+        content_type='application/json'
+    )
+    assert response.status_code == 201
+    data = json.loads(response.data)
+    assert data['successful'] == 2
+    assert data['failed'] == 0
+    assert len(data['imported']) == 2
+
+def test_import_certificate_wrapped_format(client, sample_equipment):
+    """测试包装格式导入证书（{data: [...]})"""
+    response = client.post('/api/certificates/import',
+        data=json.dumps({
+            'operator': 'Test Operator',
+            'batch_id': f'BATCH-WRAPPED-{int(time.time())}',
+            'data': [{
+                'cert_no': f'CERT-WRAPPED-{int(time.time())}',
+                'equipment_no': 'EQ-TEST-001',
+                'calibration_date': '2026-01-01',
+                'valid_until': '2027-01-01',
+                'range_min': 0,
+                'range_max': 100,
+                'unit': 'V',
+                'deviation': 0.02,
+                'calibrator': 'Zhang San'
+            }]
+        }),
+        content_type='application/json'
+    )
+    assert response.status_code == 201
+    data = json.loads(response.data)
+    assert data['successful'] == 1
+    assert data['failed'] == 0
+    assert len(data['imported']) == 1
+
+def test_import_certificate_no_500_on_array(client, sample_equipment):
+    """测试数组格式导入不会返回 500"""
+    response = client.post('/api/certificates/import',
+        data=json.dumps([{
+            'cert_no': f'CERT-NO500-{int(time.time())}',
+            'equipment_no': 'EQ-TEST-001',
+            'calibration_date': '2026-01-01',
+            'valid_until': '2027-01-01',
+            'range_min': 0,
+            'range_max': 100,
+            'unit': 'V',
+            'deviation': 0.02
+        }]),
+        content_type='application/json'
+    )
+    assert response.status_code in [200, 201, 400]
+    assert response.status_code != 500
+
+def test_import_error_certificate_still_fails(client, sample_equipment):
+    """测试错误证书仍按预期失败（设备不存在）"""
+    response = client.post('/api/certificates/import',
+        data=json.dumps([{
+            'cert_no': f'CERT-ERROR-{int(time.time())}',
+            'equipment_no': 'EQ-NONEXISTENT',
+            'calibration_date': '2026-01-01',
+            'valid_until': '2027-01-01',
+            'range_min': 0,
+            'range_max': 100,
+            'unit': 'V',
+            'deviation': 0.02
+        }]),
+        content_type='application/json'
+    )
+    assert response.status_code == 400
+    data = json.loads(response.data)
+    assert data['failed'] == 1
+    assert 'not found' in str(data['errors'][0]['errors']).lower()

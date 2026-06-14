@@ -106,15 +106,21 @@ def create_equipment():
 @app.route('/api/certificates/import', methods=['POST'])
 def import_certificates():
     data = request.json
-    operator = data.get('operator', 'system')
-    batch_id = data.get('batch_id')
 
     content_type = request.content_type or ''
     if 'application/json' in content_type:
-        if 'data' in data:
+        if isinstance(data, list):
+            data_list = data
+            operator = 'system'
+            batch_id = None
+        elif 'data' in data:
             data_list = data['data']
+            operator = data.get('operator', 'system')
+            batch_id = data.get('batch_id')
         else:
             data_list = [data]
+            operator = data.get('operator', 'system')
+            batch_id = data.get('batch_id')
     else:
         return jsonify({'error': 'Content-Type must be application/json'}), 400
 
