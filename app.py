@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from models import db, Equipment, Certificate, AuditLog, WorkflowStatus
-from services import CertificateImportService, WorkflowService, ExportService
+from services import CertificateImportService, WorkflowService, ExportService, ExpiryWarningService, BatchStatsService, ConfigService
 from validators import parse_csv_to_json
 import os
 import json
@@ -318,9 +318,11 @@ def list_audit_logs():
 @app.route('/api/export/equipment/<int:equipment_id>', methods=['GET'])
 def export_by_equipment(equipment_id):
     format_type = request.args.get('format', 'json')
+    valid_from = request.args.get('valid_from')
+    valid_to = request.args.get('valid_to')
 
     export_service = ExportService()
-    result = export_service.export_by_equipment(equipment_id, format_type)
+    result = export_service.export_by_equipment(equipment_id, format_type, valid_from, valid_to)
 
     if format_type == 'csv':
         return send_file(
@@ -335,9 +337,11 @@ def export_by_equipment(equipment_id):
 @app.route('/api/export/batch/<batch_id>', methods=['GET'])
 def export_by_batch(batch_id):
     format_type = request.args.get('format', 'json')
+    valid_from = request.args.get('valid_from')
+    valid_to = request.args.get('valid_to')
 
     export_service = ExportService()
-    result = export_service.export_by_batch(batch_id, format_type)
+    result = export_service.export_by_batch(batch_id, format_type, valid_from, valid_to)
 
     if format_type == 'csv':
         import io
@@ -353,9 +357,11 @@ def export_by_batch(batch_id):
 @app.route('/api/export/all', methods=['GET'])
 def export_all():
     format_type = request.args.get('format', 'json')
+    valid_from = request.args.get('valid_from')
+    valid_to = request.args.get('valid_to')
 
     export_service = ExportService()
-    result = export_service.export_all(format_type)
+    result = export_service.export_all(format_type, valid_from, valid_to)
 
     if format_type == 'csv':
         import io
@@ -367,6 +373,42 @@ def export_all():
         )
     else:
         return jsonify(json.loads(result))
+
+@app.route('/api/certificates/expiry-warning', methods=['GET'])
+def expiry_warning():
+    days = request.args.get('days', type=int)
+
+    warning_service = ExpiryWarningService()
+    certs = warning_service.get_expiring_certificates(days)
+
+    return jsonify({
+        'warning_days_used': days if days else ConfigService().get_expiry_warning_days(),
+        'count': len(certs),
+        'certificates': [cert.to_dict() for cert in certs]
+    })
+
+@app.route('/api/batches/stats', methods=['GET'])
+def batch_stats():
+    stats_service = BatchStatsService()
+    stats = stats_service.get_batch_statistics()
+    return jsonify(stats)
+
+@app.route('/api/config/expiry-warning-days', methods=['GET'])
+def get_expiry_warning_days():
+    config_service = ConfigService()
+    return jsonify({'expiry_warning_days': config_service.get_expiry_warning_days()})
+
+@app.route('/api/config/expiry-warning-days', methods=['PUT'])
+def set_expiry_warning_days():
+    data = request.json
+    days = data.get('days')
+
+    if not days or not isinstance(days, int) or days <= 0:
+        return jsonify({'error': 'Days must be a positive integer'}), 400
+
+    config_service = ConfigService()
+    config_service.set_expiry_warning_days(days)
+    return jsonify({'expiry_warning_days': days})
 
 @app.errorhandler(404)
 def not_found(e):

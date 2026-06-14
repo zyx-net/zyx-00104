@@ -1,9 +1,82 @@
 from models import db, Certificate, Equipment, AuditLog, WorkflowStatus
 from validators import CertificateValidator, CertificateImportSchema, parse_csv_to_json
 from marshmallow import ValidationError
-from datetime import datetime
+from datetime import datetime, timedelta, date
 import json
 import uuid
+import os
+
+CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'config.json')
+
+class ConfigService:
+    def __init__(self):
+        self._config = None
+
+    def _load_config(self):
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                self._config = json.load(f)
+        else:
+            self._config = {'expiry_warning_days': 30}
+            self._save_config()
+
+    def _save_config(self):
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(self._config, f, indent=2)
+
+    def get_expiry_warning_days(self):
+        if self._config is None:
+            self._load_config()
+        return self._config.get('expiry_warning_days', 30)
+
+    def set_expiry_warning_days(self, days):
+        if self._config is None:
+            self._load_config()
+        self._config['expiry_warning_days'] = days
+        self._save_config()
+        return days
+
+    def get_config(self):
+        if self._config is None:
+            self._load_config()
+        return self._config.copy()
+
+class ExpiryWarningService:
+    def get_expiring_certificates(self, days=None):
+        if days is None:
+            config_service = ConfigService()
+            days = config_service.get_expiry_warning_days()
+
+        today = date.today()
+        expiry_date = today + timedelta(days=days)
+
+        certs = Certificate.query.filter(
+            Certificate.valid_until <= expiry_date,
+            Certificate.valid_until >= today
+        ).order_by(Certificate.valid_until).all()
+
+        return certs
+
+class BatchStatsService:
+    def get_batch_statistics(self):
+        from sqlalchemy import func, desc
+
+        stats = db.session.query(
+            Certificate.batch_id,
+            Certificate.workflow_status,
+            func.count(Certificate.id).label('count')
+        ).group_by(Certificate.batch_id, Certificate.workflow_status).order_by(desc('count')).all()
+
+        result = {}
+        for batch_id, status, count in stats:
+            if batch_id not in result:
+                result[batch_id] = {
+                    'total': 0
+                }
+            result[batch_id][status] = count
+            result[batch_id]['total'] += count
+
+        return result
 
 class CertificateImportService:
     def __init__(self):
@@ -268,17 +341,42 @@ class WorkflowService:
             return False, self.errors
 
 class ExportService:
-    def export_by_equipment(self, equipment_id, format='json'):
-        certs = Certificate.query.filter_by(equipment_id=equipment_id).all()
+    def export_by_equipment(self, equipment_id, format='json', valid_from=None, valid_to=None):
+        query = Certificate.query.filter_by(equipment_id=equipment_id)
+        query = self._add_valid_date_filter(query, valid_from, valid_to)
+        certs = query.all()
         return self._format_output(certs, format)
 
-    def export_by_batch(self, batch_id, format='json'):
-        certs = Certificate.query.filter_by(batch_id=batch_id).all()
+    def export_by_batch(self, batch_id, format='json', valid_from=None, valid_to=None):
+        query = Certificate.query.filter_by(batch_id=batch_id)
+        query = self._add_valid_date_filter(query, valid_from, valid_to)
+        certs = query.all()
         return self._format_output(certs, format)
 
-    def export_all(self, format='json'):
-        certs = Certificate.query.all()
+    def export_all(self, format='json', valid_from=None, valid_to=None):
+        query = Certificate.query
+        query = self._add_valid_date_filter(query, valid_from, valid_to)
+        certs = query.all()
         return self._format_output(certs, format)
+
+    def _add_valid_date_filter(self, query, valid_from, valid_to):
+        from dateutil import parser
+
+        if valid_from:
+            try:
+                from_date = parser.parse(valid_from).date()
+                query = query.filter(Certificate.valid_until >= from_date)
+            except:
+                pass
+
+        if valid_to:
+            try:
+                to_date = parser.parse(valid_to).date()
+                query = query.filter(Certificate.valid_until <= to_date)
+            except:
+                pass
+
+        return query
 
     def _format_output(self, certs, format):
         if format == 'json':

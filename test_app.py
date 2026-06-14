@@ -1,6 +1,7 @@
 import pytest
 from app import app, db
 from models import Equipment, Certificate, AuditLog, WorkflowStatus
+from datetime import datetime
 import json
 import os
 import time
@@ -843,3 +844,194 @@ def test_import_certificate_exceeds_equipment_range_still_fails(client):
     data = json.loads(response.data)
     assert data['failed'] == 1
     assert 'exceeds equipment range' in str(data['errors'][0]['errors']).lower()
+
+def test_expiry_warning_default_days(client, sample_equipment):
+    """测试过期预警接口使用默认配置"""
+    with app.app_context():
+        cert = Certificate(
+            cert_no='CERT-EXPIRY-001',
+            batch_id='BATCH-EXPIRY-TEST',
+            equipment_id=sample_equipment,
+            calibration_date=datetime(2026, 1, 1).date(),
+            valid_until=datetime(2026, 6, 20).date(),
+            range_min=0,
+            range_max=100,
+            unit='V',
+            deviation=0.02
+        )
+        db.session.add(cert)
+        db.session.commit()
+
+    response = client.get('/api/certificates/expiry-warning')
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    assert 'warning_days_used' in data
+    assert 'count' in data
+    assert 'certificates' in data
+    assert data['count'] >= 1
+
+def test_expiry_warning_custom_days(client, sample_equipment):
+    """测试过期预警接口使用自定义天数"""
+    response = client.get('/api/certificates/expiry-warning?days=7')
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    assert data['warning_days_used'] == 7
+
+def test_batch_stats(client, sample_equipment):
+    """测试批次统计接口"""
+    with app.app_context():
+        cert1 = Certificate(
+            cert_no='CERT-BATCH-001',
+            batch_id='BATCH-STATS-001',
+            equipment_id=sample_equipment,
+            calibration_date=datetime(2026, 1, 1).date(),
+            valid_until=datetime(2027, 1, 1).date(),
+            range_min=0,
+            range_max=100,
+            unit='V',
+            deviation=0.02,
+            workflow_status='draft'
+        )
+        cert2 = Certificate(
+            cert_no='CERT-BATCH-002',
+            batch_id='BATCH-STATS-001',
+            equipment_id=sample_equipment,
+            calibration_date=datetime(2026, 1, 1).date(),
+            valid_until=datetime(2027, 1, 1).date(),
+            range_min=0,
+            range_max=100,
+            unit='V',
+            deviation=0.02,
+            workflow_status='released'
+        )
+        cert3 = Certificate(
+            cert_no='CERT-BATCH-003',
+            batch_id='BATCH-STATS-002',
+            equipment_id=sample_equipment,
+            calibration_date=datetime(2026, 1, 1).date(),
+            valid_until=datetime(2027, 1, 1).date(),
+            range_min=0,
+            range_max=100,
+            unit='V',
+            deviation=0.02,
+            workflow_status='approved'
+        )
+        db.session.add_all([cert1, cert2, cert3])
+        db.session.commit()
+
+    response = client.get('/api/batches/stats')
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    assert 'BATCH-STATS-001' in data
+    assert 'BATCH-STATS-002' in data
+    assert data['BATCH-STATS-001']['total'] == 2
+    assert data['BATCH-STATS-001']['draft'] == 1
+    assert data['BATCH-STATS-001']['released'] == 1
+    assert data['BATCH-STATS-002']['total'] == 1
+    assert data['BATCH-STATS-002']['approved'] == 1
+
+def test_config_get_expiry_warning_days(client):
+    """测试获取配置的过期预警天数"""
+    response = client.get('/api/config/expiry-warning-days')
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    assert 'expiry_warning_days' in data
+    assert isinstance(data['expiry_warning_days'], int)
+    assert data['expiry_warning_days'] > 0
+
+def test_config_set_expiry_warning_days(client):
+    """测试设置配置的过期预警天数"""
+    response = client.put('/api/config/expiry-warning-days',
+        data=json.dumps({'days': 60}),
+        content_type='application/json'
+    )
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    assert data['expiry_warning_days'] == 60
+
+    get_response = client.get('/api/config/expiry-warning-days')
+    assert get_response.status_code == 200
+    get_data = json.loads(get_response.data)
+    assert get_data['expiry_warning_days'] == 60
+
+def test_config_set_expiry_warning_days_invalid(client):
+    """测试设置无效的过期预警天数"""
+    response = client.put('/api/config/expiry-warning-days',
+        data=json.dumps({'days': -1}),
+        content_type='application/json'
+    )
+    assert response.status_code == 400
+
+    response = client.put('/api/config/expiry-warning-days',
+        data=json.dumps({'days': 'invalid'}),
+        content_type='application/json'
+    )
+    assert response.status_code == 400
+
+def test_export_by_equipment_with_date_range(client, sample_equipment):
+    """测试按设备导出时按到期时间范围筛选"""
+    with app.app_context():
+        cert1 = Certificate(
+            cert_no='CERT-DATE-001',
+            batch_id='BATCH-DATE-TEST',
+            equipment_id=sample_equipment,
+            calibration_date=datetime(2026, 1, 1).date(),
+            valid_until=datetime(2026, 6, 15).date(),
+            range_min=0,
+            range_max=100,
+            unit='V',
+            deviation=0.02
+        )
+        cert2 = Certificate(
+            cert_no='CERT-DATE-002',
+            batch_id='BATCH-DATE-TEST',
+            equipment_id=sample_equipment,
+            calibration_date=datetime(2026, 1, 1).date(),
+            valid_until=datetime(2026, 6, 30).date(),
+            range_min=0,
+            range_max=100,
+            unit='V',
+            deviation=0.02
+        )
+        db.session.add_all([cert1, cert2])
+        db.session.commit()
+
+    response = client.get(f'/api/export/equipment/{sample_equipment}?valid_from=2026-06-14&valid_to=2026-06-20')
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    assert len(data) == 1
+    assert data[0]['cert_no'] == 'CERT-DATE-001'
+
+def test_export_by_batch_with_date_range(client, sample_equipment):
+    """测试按批次导出时按到期时间范围筛选"""
+    with app.app_context():
+        cert1 = Certificate(
+            cert_no='CERT-BATCH-DATE-001',
+            batch_id='BATCH-DATE-FILTER',
+            equipment_id=sample_equipment,
+            calibration_date=datetime(2026, 1, 1).date(),
+            valid_until=datetime(2026, 6, 15).date(),
+            range_min=0,
+            range_max=100,
+            unit='V',
+            deviation=0.02
+        )
+        cert2 = Certificate(
+            cert_no='CERT-BATCH-DATE-002',
+            batch_id='BATCH-DATE-FILTER',
+            equipment_id=sample_equipment,
+            calibration_date=datetime(2026, 1, 1).date(),
+            valid_until=datetime(2026, 7, 1).date(),
+            range_min=0,
+            range_max=100,
+            unit='V',
+            deviation=0.02
+        )
+        db.session.add_all([cert1, cert2])
+        db.session.commit()
+
+    response = client.get('/api/export/batch/BATCH-DATE-FILTER?valid_to=2026-06-30')
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    assert len(data) == 1
+    assert data[0]['cert_no'] == 'CERT-BATCH-DATE-001'
