@@ -425,6 +425,27 @@ curl -X PUT http://localhost:5000/api/config/expiry-warning-days \
   -d '{"days": 60}'
 ```
 
+#### 获取过期检测间隔配置
+```bash
+curl http://localhost:5000/api/config/expiry-check-interval
+```
+
+响应示例：
+```json
+{
+  "expiry_check_interval_hours": 24,
+  "last_check_time": "2026-06-13T10:00:00",
+  "check_in_progress": false
+}
+```
+
+#### 设置过期检测间隔
+```bash
+curl -X PUT http://localhost:5000/api/config/expiry-check-interval \
+  -H "Content-Type: application/json" \
+  -d '{"hours": 12}'
+```
+
 ### 审计日志
 
 #### 查看所有审计记录
@@ -445,6 +466,11 @@ curl "http://localhost:5000/api/audit?operator=Metrologist1"
 #### 按批次筛选
 ```bash
 curl "http://localhost:5000/api/audit?batch_id=BATCH-2024-001"
+```
+
+#### 按操作类型筛选（包括权限拒绝）
+```bash
+curl "http://localhost:5000/api/audit?action=permission_denied"
 ```
 
 ### 数据导出
@@ -776,8 +802,8 @@ DRAFT → ENTERED → REVIEWED → APPROVED → RELEASED/LIMITED/STOPPED
 
 - `timestamp`: 操作时间
 - `operator`: 操作者
-- `action`: 操作类型（import, enter, review, approve, release, limit, stop, revert）
-- `resource_type`: 资源类型（equipment, certificate）
+- `action`: 操作类型（import, enter, review, approve, release, limit, stop, revert, permission_denied）
+- `resource_type`: 资源类型（equipment, certificate, system）
 - `resource_id`: 资源ID
 - `notes`: 备注
 - `decision_basis`: 决策依据
@@ -788,6 +814,124 @@ DRAFT → ENTERED → REVIEWED → APPROVED → RELEASED/LIMITED/STOPPED
 - `reverted_by`: 撤销操作人
 - `reverted_at`: 撤销时间
 - `revert_log_id`: 关联的撤销日志ID
+- `denied_reason`: 权限拒绝原因（仅 permission_denied 事件）
+
+## 角色权限说明
+
+系统支持三种角色，各角色权限如下：
+
+| 角色 | 录入员 (operator) | 计量员 (metrologist) | 主管 (supervisor) |
+|------|------------------|---------------------|-------------------|
+| 导入证书 | ✓ | ✓ | ✓ |
+| 录入证书 | ✓ | ✓ | ✓ |
+| 复核证书 | ✗ | ✓ | ✓ |
+| 批准证书 | ✗ | ✗ | ✓ |
+| 放行证书 | ✗ | ✗ | ✓ |
+| 限用证书 | ✗ | ✗ | ✓ |
+| 停用证书 | ✗ | ✗ | ✓ |
+| 撤销操作 | ✗ | ✗ | ✓ |
+
+### 权限验证规则
+
+1. **角色不匹配时返回 403**：当用户执行超出其角色权限的操作时，系统返回 403 Forbidden
+2. **权限拒绝事件记录**：所有权限拒绝事件都会被记录到审计日志，方便排查
+3. **录入员不能放行自己的单**：即使是主管角色，也受此规则限制
+
+### 权限拒绝响应示例
+
+```json
+{
+  "error": "Action 'approve' requires role: 主管, but user has role: 录入员",
+  "required_role": ["supervisor"],
+  "operator_role": "operator",
+  "action": "approve",
+  "resource_type": "certificate",
+  "resource_id": 123
+}
+```
+
+## 用户管理
+
+### 创建用户
+
+```bash
+curl -X POST http://localhost:5000/api/users \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "Zhang San",
+    "role": "operator"
+  }'
+```
+
+有效角色值：`operator`、`metrologist`、`supervisor`
+
+### 获取用户列表
+
+```bash
+curl http://localhost:5000/api/users
+```
+
+### 获取单个用户
+
+```bash
+curl http://localhost:5000/api/users/Zhang%20San
+```
+
+### 更新用户角色
+
+```bash
+curl -X PUT http://localhost:5000/api/users/Zhang%20San/role \
+  -H "Content-Type: application/json" \
+  -d '{"role": "supervisor"}'
+```
+
+## 定时任务调度器
+
+### 调度器状态
+
+```bash
+curl http://localhost:5000/api/scheduler/status
+```
+
+响应示例：
+```json
+{
+  "running": true,
+  "last_check_time": "2026-06-13T10:00:00",
+  "check_interval_hours": 24,
+  "check_in_progress": false
+}
+```
+
+### 启动调度器
+
+```bash
+curl -X POST http://localhost:5000/api/scheduler/start
+```
+
+### 停止调度器
+
+```bash
+curl -X POST http://localhost:5000/api/scheduler/stop
+```
+
+### 调度器特性
+
+1. **自动启动**：服务启动时自动启动调度器
+2. **平滑停止**：服务停止时自动停止调度器
+3. **持久化配置**：调度器配置保存在 `config.json` 中，重启后恢复
+4. **冲突保护**：如果检测任务正在运行，手动触发会返回 409 Conflict
+
+### 并发冲突保护
+
+当定时检测任务正在执行时，如果有人手动调用过期处理接口，系统会返回 409 Conflict：
+
+```json
+{
+  "error": "Another expiry check is already in progress",
+  "conflict": true
+}
+```
 
 ## 目录结构
 
@@ -797,6 +941,8 @@ DRAFT → ENTERED → REVIEWED → APPROVED → RELEASED/LIMITED/STOPPED
 ├── models.py               # 数据模型
 ├── services.py             # 业务逻辑层
 ├── validators.py           # 数据校验
+├── test_app.py            # 基础功能测试
+├── test_scheduler.py      # 调度器和权限测试
 ├── requirements.txt        # 依赖列表
 ├── calibration.db          # SQLite 数据库（自动生成）
 ├── samples/

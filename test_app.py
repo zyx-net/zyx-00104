@@ -1,6 +1,6 @@
 import pytest
 from app import app, db
-from models import Equipment, Certificate, AuditLog, WorkflowStatus
+from models import Equipment, Certificate, AuditLog, WorkflowStatus, User
 from datetime import datetime
 import json
 import os
@@ -13,6 +13,14 @@ def client():
 
     with app.app_context():
         db.create_all()
+        operator1 = User(username='Operator1', role='operator')
+        operator2 = User(username='Operator2', role='operator')
+        metrologist1 = User(username='Metrologist1', role='metrologist')
+        supervisor1 = User(username='Supervisor1', role='supervisor')
+        supervisor2 = User(username='Supervisor2', role='supervisor')
+        admin1 = User(username='Admin1', role='supervisor')
+        db.session.add_all([operator1, operator2, metrologist1, supervisor1, supervisor2, admin1])
+        db.session.commit()
         yield app.test_client()
         db.session.remove()
         db.drop_all()
@@ -278,7 +286,7 @@ def test_workflow_full_path(client, sample_equipment):
 
     release_response = client.post(f'/api/certificates/{cert_id}/release',
         data=json.dumps({
-            'operator': 'Operator2',
+            'operator': 'Supervisor2',
             'notes': 'Device cleared for use',
             'decision_basis': 'All checks passed'
         }),
@@ -287,7 +295,7 @@ def test_workflow_full_path(client, sample_equipment):
     assert release_response.status_code == 200
     release_data = json.loads(release_response.data)
     assert release_data['workflow_status'] == 'released'
-    assert release_data['released_by'] == 'Operator2'
+    assert release_data['released_by'] == 'Supervisor2'
 
 def test_operator_cannot_release_own_entry(client, sample_equipment):
     import_response = client.post('/api/certificates/import',
@@ -332,9 +340,9 @@ def test_operator_cannot_release_own_entry(client, sample_equipment):
         }),
         content_type='application/json'
     )
-    assert release_response.status_code == 400
+    assert release_response.status_code == 403
     release_data = json.loads(release_response.data)
-    assert any('cannot release their own entry' in str(err).lower() for err in release_data['errors'])
+    assert 'release' in release_data['error'].lower()
 
 def test_audit_log_completeness(client, sample_equipment):
     import_response = client.post('/api/certificates/import',
@@ -1143,7 +1151,7 @@ def test_batch_release_mixed_states(client, sample_equipment):
 
     response = client.post('/api/certificates/batch/release',
         data=json.dumps({
-            'operator': 'Operator2',
+            'operator': 'Supervisor2',
             'certificate_ids': cert_ids,
             'decision_basis': 'Batch release test'
         }),
@@ -1157,7 +1165,7 @@ def test_batch_release_mixed_states(client, sample_equipment):
 
 
 def test_batch_release_self_entry_blocked(client, sample_equipment):
-    """测试批量放行时录入员不能放行自己录入的证书"""
+    """测试批量放行时主管不能放行自己录入的证书"""
     cert_ids = []
     with app.app_context():
         cert = Certificate(
@@ -1177,7 +1185,7 @@ def test_batch_release_self_entry_blocked(client, sample_equipment):
         db.session.commit()
 
     client.post(f'/api/certificates/{cert_ids[0]}/enter',
-        data=json.dumps({'operator': 'Operator1'}),
+        data=json.dumps({'operator': 'Supervisor2'}),
         content_type='application/json'
     )
     client.post(f'/api/certificates/{cert_ids[0]}/review',
@@ -1191,7 +1199,7 @@ def test_batch_release_self_entry_blocked(client, sample_equipment):
 
     response = client.post('/api/certificates/batch/release',
         data=json.dumps({
-            'operator': 'Operator1',
+            'operator': 'Supervisor2',
             'certificate_ids': cert_ids,
             'decision_basis': 'Try to release own entry'
         }),
@@ -1451,7 +1459,7 @@ def test_batch_release_all_success(client, sample_equipment):
 
     response = client.post('/api/certificates/batch/release',
         data=json.dumps({
-            'operator': 'Operator2',
+            'operator': 'Supervisor2',
             'certificate_ids': cert_ids,
             'decision_basis': 'All released'
         }),

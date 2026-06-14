@@ -1,4 +1,4 @@
-from models import db, Certificate, Equipment, AuditLog, WorkflowStatus
+from models import db, Certificate, Equipment, AuditLog, WorkflowStatus, User, UserRole
 from validators import CertificateValidator, CertificateImportSchema, parse_csv_to_json
 from marshmallow import ValidationError
 from datetime import datetime, timedelta, date
@@ -7,6 +7,128 @@ import uuid
 import os
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'config.json')
+
+
+class PermissionDeniedException(Exception):
+    def __init__(self, message, required_role, operator_role, action, resource_type=None, resource_id=None):
+        self.message = message
+        self.required_role = required_role
+        self.operator_role = operator_role
+        self.action = action
+        self.resource_type = resource_type
+        self.resource_id = resource_id
+        super().__init__(self.message)
+
+
+class RolePermissionService:
+    ROLE_HIERARCHY = {
+        UserRole.SUPERVISOR.value: ['import', 'enter', 'review', 'approve', 'release', 'limit', 'stop', 'revert'],
+        UserRole.METROLOGIST.value: ['import', 'enter', 'review'],
+        UserRole.OPERATOR.value: ['import', 'enter']
+    }
+
+    REQUIRED_ROLES = {
+        'import': [UserRole.OPERATOR.value, UserRole.METROLOGIST.value, UserRole.SUPERVISOR.value],
+        'enter': [UserRole.OPERATOR.value, UserRole.METROLOGIST.value, UserRole.SUPERVISOR.value],
+        'review': [UserRole.METROLOGIST.value, UserRole.SUPERVISOR.value],
+        'approve': [UserRole.SUPERVISOR.value],
+        'release': [UserRole.SUPERVISOR.value],
+        'limit': [UserRole.SUPERVISOR.value],
+        'stop': [UserRole.SUPERVISOR.value],
+        'revert': [UserRole.SUPERVISOR.value]
+    }
+
+    @staticmethod
+    def get_user_role(username):
+        user = User.query.filter_by(username=username).first()
+        if user:
+            return user.role
+        return UserRole.OPERATOR.value
+
+    @staticmethod
+    def can_perform_action(username, action):
+        role = RolePermissionService.get_user_role(username)
+        allowed_roles = RolePermissionService.REQUIRED_ROLES.get(action, [])
+        return role in allowed_roles
+
+    @staticmethod
+    def check_permission(username, action, resource_type=None, resource_id=None):
+        role = RolePermissionService.get_user_role(username)
+        allowed_roles = RolePermissionService.REQUIRED_ROLES.get(action, [])
+
+        if role not in allowed_roles:
+            required = '/'.join(RolePermissionService._get_role_display_name(r) for r in allowed_roles)
+            denied_reason = f"Action '{action}' requires role: {required}, but user has role: {RolePermissionService._get_role_display_name(role)}"
+
+            audit = AuditLog(
+                operator=username,
+                action='permission_denied',
+                resource_type=resource_type or 'system',
+                resource_id=resource_id,
+                notes=denied_reason,
+                version=1,
+                denied_reason=denied_reason
+            )
+            db.session.add(audit)
+            db.session.commit()
+
+            raise PermissionDeniedException(
+                message=denied_reason,
+                required_role=allowed_roles,
+                operator_role=role,
+                action=action,
+                resource_type=resource_type,
+                resource_id=resource_id
+            )
+
+        return True
+
+    @staticmethod
+    def _get_role_display_name(role):
+        role_names = {
+            UserRole.OPERATOR.value: '录入员',
+            UserRole.METROLOGIST.value: '计量员',
+            UserRole.SUPERVISOR.value: '主管'
+        }
+        return role_names.get(role, role)
+
+
+class UserService:
+    @staticmethod
+    def create_user(username, role):
+        if role not in [r.value for r in UserRole]:
+            raise ValueError(f"Invalid role: {role}")
+
+        existing = User.query.filter_by(username=username).first()
+        if existing:
+            raise ValueError(f"User {username} already exists")
+
+        user = User(username=username, role=role)
+        db.session.add(user)
+        db.session.commit()
+        return user
+
+    @staticmethod
+    def get_user(username):
+        return User.query.filter_by(username=username).first()
+
+    @staticmethod
+    def update_user_role(username, new_role):
+        user = User.query.filter_by(username=username).first()
+        if not user:
+            raise ValueError(f"User {username} not found")
+
+        if new_role not in [r.value for r in UserRole]:
+            raise ValueError(f"Invalid role: {new_role}")
+
+        user.role = new_role
+        db.session.commit()
+        return user
+
+    @staticmethod
+    def list_users():
+        return User.query.all()
+
 
 class ConfigService:
     def __init__(self):
@@ -17,7 +139,7 @@ class ConfigService:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 self._config = json.load(f)
         else:
-            self._config = {'expiry_warning_days': 30}
+            self._config = {'expiry_warning_days': 30, 'expiry_check_interval_hours': 24}
             self._save_config()
 
     def _save_config(self):
@@ -35,6 +157,40 @@ class ConfigService:
         self._config['expiry_warning_days'] = days
         self._save_config()
         return days
+
+    def get_expiry_check_interval_hours(self):
+        if self._config is None:
+            self._load_config()
+        return self._config.get('expiry_check_interval_hours', 24)
+
+    def set_expiry_check_interval_hours(self, hours):
+        if self._config is None:
+            self._load_config()
+        self._config['expiry_check_interval_hours'] = hours
+        self._save_config()
+        return hours
+
+    def get_last_expiry_check_time(self):
+        if self._config is None:
+            self._load_config()
+        return self._config.get('last_expiry_check_time')
+
+    def set_last_expiry_check_time(self, timestamp):
+        if self._config is None:
+            self._load_config()
+        self._config['last_expiry_check_time'] = timestamp
+        self._save_config()
+
+    def get_expiry_check_in_progress(self):
+        if self._config is None:
+            self._load_config()
+        return self._config.get('expiry_check_in_progress', False)
+
+    def set_expiry_check_in_progress(self, in_progress):
+        if self._config is None:
+            self._load_config()
+        self._config['expiry_check_in_progress'] = in_progress
+        self._save_config()
 
     def get_config(self):
         if self._config is None:
@@ -83,6 +239,7 @@ class CertificateImportService:
         self.validator = CertificateValidator()
 
     def import_certificates(self, data_list, operator, batch_id=None):
+        RolePermissionService.check_permission(operator, 'import', 'system')
         if not batch_id:
             batch_id = str(uuid.uuid4())
 
@@ -225,15 +382,19 @@ class WorkflowService:
         self.errors = []
 
     def enter(self, certificate_id, operator, notes=''):
+        RolePermissionService.check_permission(operator, 'enter', 'certificate', certificate_id)
         return self._transition(certificate_id, operator, WorkflowStatus.ENTERED, 'enter', notes)
 
     def review(self, certificate_id, operator, notes='', decision_basis=''):
+        RolePermissionService.check_permission(operator, 'review', 'certificate', certificate_id)
         return self._transition(certificate_id, operator, WorkflowStatus.REVIEWED, 'review', notes, decision_basis)
 
     def approve(self, certificate_id, operator, notes='', decision_basis=''):
+        RolePermissionService.check_permission(operator, 'approve', 'certificate', certificate_id)
         return self._transition(certificate_id, operator, WorkflowStatus.APPROVED, 'approve', notes, decision_basis)
 
     def release(self, certificate_id, operator, notes='', decision_basis=''):
+        RolePermissionService.check_permission(operator, 'release', 'certificate', certificate_id)
         cert = Certificate.query.get(certificate_id)
         if not cert:
             return False, [{'error': 'Certificate not found'}]
@@ -244,9 +405,11 @@ class WorkflowService:
         return self._transition(certificate_id, operator, WorkflowStatus.RELEASED, 'release', notes, decision_basis)
 
     def limit(self, certificate_id, operator, notes='', decision_basis=''):
+        RolePermissionService.check_permission(operator, 'limit', 'certificate', certificate_id)
         return self._transition(certificate_id, operator, WorkflowStatus.LIMITED, 'limit', notes, decision_basis)
 
     def stop(self, certificate_id, operator, notes='', decision_basis=''):
+        RolePermissionService.check_permission(operator, 'stop', 'certificate', certificate_id)
         return self._transition(certificate_id, operator, WorkflowStatus.STOPPED, 'stop', notes, decision_basis)
 
     def _transition(self, certificate_id, operator, new_status, action, notes='', decision_basis=''):
@@ -345,6 +508,23 @@ class BatchWorkflowService:
         self.workflow_service = WorkflowService()
 
     def batch_approve(self, certificate_ids, operator, notes='', decision_basis=''):
+        try:
+            RolePermissionService.check_permission(operator, 'approve', 'system')
+        except PermissionDeniedException as e:
+            return {
+                'total': len(certificate_ids),
+                'successful': 0,
+                'failed': len(certificate_ids),
+                'results': [
+                    {
+                        'certificate_id': cert_id,
+                        'cert_no': Certificate.query.get(cert_id).cert_no if Certificate.query.get(cert_id) else None,
+                        'success': False,
+                        'errors': [str(e)]
+                    } for cert_id in certificate_ids
+                ]
+            }
+
         results = {
             'total': len(certificate_ids),
             'successful': 0,
@@ -374,6 +554,23 @@ class BatchWorkflowService:
         return results
 
     def batch_release(self, certificate_ids, operator, notes='', decision_basis=''):
+        try:
+            RolePermissionService.check_permission(operator, 'release', 'system')
+        except PermissionDeniedException as e:
+            return {
+                'total': len(certificate_ids),
+                'successful': 0,
+                'failed': len(certificate_ids),
+                'results': [
+                    {
+                        'certificate_id': cert_id,
+                        'cert_no': Certificate.query.get(cert_id).cert_no if Certificate.query.get(cert_id) else None,
+                        'success': False,
+                        'errors': [str(e)]
+                    } for cert_id in certificate_ids
+                ]
+            }
+
         results = {
             'total': len(certificate_ids),
             'successful': 0,
@@ -426,6 +623,7 @@ class BatchWorkflowService:
 
 class RevertService:
     def revert_last_workflow_change(self, certificate_id, operator, notes=''):
+        RolePermissionService.check_permission(operator, 'revert', 'certificate', certificate_id)
         cert = Certificate.query.get(certificate_id)
         if not cert:
             return False, [{'error': 'Certificate not found'}]
@@ -512,81 +710,99 @@ class RevertService:
             return False, [{'error': str(e)}]
 
 
+class ExpiryCheckConflictException(Exception):
+    def __init__(self, message="Another expiry check is already in progress"):
+        self.message = message
+        super().__init__(self.message)
+
+
 class ExpiryAutoTransitionService:
     SYSTEM_OPERATOR = 'SYSTEM_AUTO_EXPIRY'
 
-    def process_expired_certificates(self):
-        today = date.today()
-        
-        expired_certs = Certificate.query.filter(
-            Certificate.valid_until < today,
-            Certificate.workflow_status.in_([
-                WorkflowStatus.DRAFT.value,
-                WorkflowStatus.ENTERED.value,
-                WorkflowStatus.REVIEWED.value,
-                WorkflowStatus.APPROVED.value
-            ])
-        ).all()
+    def process_expired_certificates(self, source='manual'):
+        config_service = ConfigService()
 
-        results = {
-            'processed': 0,
-            'limited': 0,
-            'stopped': 0,
-            'equipment_updated': 0,
-            'details': []
-        }
+        if config_service.get_expiry_check_in_progress():
+            raise ExpiryCheckConflictException()
 
-        for cert in expired_certs:
-            new_status = self._determine_expiry_status(cert)
-            
-            previous_status = cert.workflow_status
-            cert.workflow_status = new_status.value
-            cert.version += 1
-            cert.updated_at = datetime.utcnow()
-            cert.released_by = self.SYSTEM_OPERATOR
-            cert.released_at = datetime.utcnow()
-
-            audit = AuditLog(
-                operator=self.SYSTEM_OPERATOR,
-                action='auto_expiry_transition',
-                resource_type='certificate',
-                resource_id=cert.id,
-                certificate_id=cert.id,
-                batch_id=cert.batch_id,
-                notes=f'Certificate auto-transitioned to {new_status.value} due to expiry (valid_until: {cert.valid_until})',
-                decision_basis='System automatic expiry processing',
-                version=cert.version,
-                previous_state=previous_status,
-                new_state=new_status.value
-            )
-            db.session.add(audit)
-
-            results['processed'] += 1
-            if new_status == WorkflowStatus.LIMITED:
-                results['limited'] += 1
-            else:
-                results['stopped'] += 1
-
-            results['details'].append({
-                'certificate_id': cert.id,
-                'cert_no': cert.cert_no,
-                'previous_status': previous_status,
-                'new_status': new_status.value,
-                'valid_until': cert.valid_until.isoformat()
-            })
-
-        db.session.flush()
-        
-        equipment_updates = self._update_equipment_status()
-        results['equipment_updated'] = equipment_updates
-
+        config_service.set_expiry_check_in_progress(True)
         try:
-            db.session.commit()
-        except Exception as e:
-            db.session.rollback()
-            raise e
+            today = date.today()
+            
+            expired_certs = Certificate.query.filter(
+                Certificate.valid_until < today,
+                Certificate.workflow_status.in_([
+                    WorkflowStatus.DRAFT.value,
+                    WorkflowStatus.ENTERED.value,
+                    WorkflowStatus.REVIEWED.value,
+                    WorkflowStatus.APPROVED.value
+                ])
+            ).all()
 
-        return results
+            results = {
+                'processed': 0,
+                'limited': 0,
+                'stopped': 0,
+                'equipment_updated': 0,
+                'details': []
+            }
+
+            for cert in expired_certs:
+                new_status = self._determine_expiry_status(cert)
+                
+                previous_status = cert.workflow_status
+                cert.workflow_status = new_status.value
+                cert.version += 1
+                cert.updated_at = datetime.utcnow()
+                cert.released_by = self.SYSTEM_OPERATOR
+                cert.released_at = datetime.utcnow()
+
+                audit = AuditLog(
+                    operator=self.SYSTEM_OPERATOR,
+                    action='auto_expiry_transition',
+                    resource_type='certificate',
+                    resource_id=cert.id,
+                    certificate_id=cert.id,
+                    batch_id=cert.batch_id,
+                    notes=f'Certificate auto-transitioned to {new_status.value} due to expiry (valid_until: {cert.valid_until})',
+                    decision_basis=f'System automatic expiry processing (source: {source})',
+                    version=cert.version,
+                    previous_state=previous_status,
+                    new_state=new_status.value
+                )
+                db.session.add(audit)
+
+                results['processed'] += 1
+                if new_status == WorkflowStatus.LIMITED:
+                    results['limited'] += 1
+                else:
+                    results['stopped'] += 1
+
+                results['details'].append({
+                    'certificate_id': cert.id,
+                    'cert_no': cert.cert_no,
+                    'previous_status': previous_status,
+                    'new_status': new_status.value,
+                    'valid_until': cert.valid_until.isoformat()
+                })
+
+            db.session.flush()
+            
+            equipment_updates = self._update_equipment_status()
+            results['equipment_updated'] = equipment_updates
+
+            config_service.set_last_expiry_check_time(datetime.utcnow().isoformat())
+
+            try:
+                db.session.commit()
+            except Exception as e:
+                db.session.rollback()
+                raise e
+
+            return results
+
+        finally:
+            config_service.set_expiry_check_in_progress(False)
 
     def _determine_expiry_status(self, cert):
         equipment = cert.equipment
@@ -784,3 +1000,68 @@ class ExportService:
                 writer.writerow(cert.to_dict())
             return output.getvalue()
         return ''
+
+
+class ScheduledTaskService:
+    _scheduler_thread = None
+    _stop_event = None
+
+    @classmethod
+    def start_scheduler(cls, app):
+        from threading import Thread, Event
+        import time
+
+        if cls._scheduler_thread is not None and cls._scheduler_thread.is_alive():
+            return
+
+        cls._stop_event = Event()
+        cls._scheduler_thread = Thread(target=cls._scheduler_loop, args=(app, cls._stop_event), daemon=True)
+        cls._scheduler_thread.start()
+
+    @classmethod
+    def stop_scheduler(cls):
+        if cls._stop_event is not None:
+            cls._stop_event.set()
+        if cls._scheduler_thread is not None:
+            cls._scheduler_thread.join(timeout=5)
+
+    @classmethod
+    def _scheduler_loop(cls, app, stop_event):
+        import time
+        from datetime import datetime
+
+        while not stop_event.is_set():
+            with app.app_context():
+                try:
+                    config_service = ConfigService()
+                    interval_hours = config_service.get_expiry_check_interval_hours()
+                    last_check = config_service.get_last_expiry_check_time()
+
+                    should_run = True
+                    if last_check:
+                        try:
+                            last_time = datetime.fromisoformat(last_check)
+                            hours_since_last = (datetime.utcnow() - last_time).total_seconds() / 3600
+                            should_run = hours_since_last >= interval_hours
+                        except:
+                            pass
+
+                    if should_run:
+                        expiry_service = ExpiryAutoTransitionService()
+                        try:
+                            expiry_service.process_expired_certificates(source='scheduled')
+                        except ExpiryCheckConflictException:
+                            pass
+                except Exception as e:
+                    pass
+
+            time.sleep(60)
+
+    @classmethod
+    def get_scheduler_status(cls):
+        return {
+            'running': cls._scheduler_thread is not None and cls._scheduler_thread.is_alive(),
+            'last_check_time': ConfigService().get_last_expiry_check_time(),
+            'check_interval_hours': ConfigService().get_expiry_check_interval_hours(),
+            'check_in_progress': ConfigService().get_expiry_check_in_progress()
+        }

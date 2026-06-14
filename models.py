@@ -4,6 +4,11 @@ from enum import Enum
 
 db = SQLAlchemy()
 
+class UserRole(Enum):
+    OPERATOR = "operator"
+    METROLOGIST = "metrologist"
+    SUPERVISOR = "supervisor"
+
 class WorkflowStatus(Enum):
     DRAFT = "draft"
     ENTERED = "entered"
@@ -53,6 +58,22 @@ class Equipment(db.Model):
             'status': self.status,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
+class User(db.Model):
+    __tablename__ = 'users'
+
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(100), unique=True, nullable=False, index=True)
+    role = db.Column(db.String(20), nullable=False, default=UserRole.OPERATOR.value)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'username': self.username,
+            'role': self.role,
+            'created_at': self.created_at.isoformat() if self.created_at else None
         }
 
 class Certificate(db.Model):
@@ -138,6 +159,7 @@ class AuditLog(db.Model):
     reverted_by = db.Column(db.String(100))
     reverted_at = db.Column(db.DateTime)
     revert_log_id = db.Column(db.Integer, db.ForeignKey('audit_logs.id'))
+    denied_reason = db.Column(db.Text)
 
     equipment = db.relationship('Equipment', back_populates='audit_logs')
     certificate = db.relationship('Certificate', back_populates='audit_logs')
@@ -162,5 +184,6 @@ class AuditLog(db.Model):
             'reverted': self.reverted,
             'reverted_by': self.reverted_by,
             'reverted_at': self.reverted_at.isoformat() if self.reverted_at else None,
-            'revert_log_id': self.revert_log_id
+            'revert_log_id': self.revert_log_id,
+            'denied_reason': self.denied_reason
         }

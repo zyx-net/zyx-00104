@@ -1,3 +1,6 @@
 {
-  "expiry_warning_days": 60
+  "expiry_warning_days": 60,
+  "expiry_check_interval_hours": 24,
+  "expiry_check_in_progress": false,
+  "last_expiry_check_time": "2026-06-14T05:27:23.848359"
 }

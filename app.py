@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from models import db, Equipment, Certificate, AuditLog, WorkflowStatus
-from services import CertificateImportService, WorkflowService, ExportService, ExpiryWarningService, BatchStatsService, ConfigService, BatchWorkflowService, RevertService, ExpiryAutoTransitionService, CertificateSearchService
+from services import CertificateImportService, WorkflowService, ExportService, ExpiryWarningService, BatchStatsService, ConfigService, BatchWorkflowService, RevertService, ExpiryAutoTransitionService, CertificateSearchService, RolePermissionService, UserService, PermissionDeniedException, ExpiryCheckConflictException, ScheduledTaskService
 from validators import parse_csv_to_json
 import os
 import json
@@ -356,27 +356,6 @@ def revert_certificate(certificate_id):
     else:
         return jsonify({'errors': errors}), 400
 
-@app.route('/api/audit', methods=['GET'])
-def list_audit_logs():
-    certificate_id = request.args.get('certificate_id')
-    equipment_id = request.args.get('equipment_id')
-    batch_id = request.args.get('batch_id')
-    operator = request.args.get('operator')
-
-    query = AuditLog.query
-
-    if certificate_id:
-        query = query.filter_by(certificate_id=int(certificate_id))
-    if equipment_id:
-        query = query.filter_by(equipment_id=int(equipment_id))
-    if batch_id:
-        query = query.filter_by(batch_id=batch_id)
-    if operator:
-        query = query.filter_by(operator=operator)
-
-    logs = query.order_by(AuditLog.timestamp.desc()).all()
-    return jsonify([log.to_dict() for log in logs])
-
 @app.route('/api/export/equipment/<int:equipment_id>', methods=['GET'])
 def export_by_equipment(equipment_id):
     format_type = request.args.get('format', 'json')
@@ -476,8 +455,10 @@ def set_expiry_warning_days():
 def process_expiry():
     expiry_service = ExpiryAutoTransitionService()
     try:
-        results = expiry_service.process_expired_certificates()
+        results = expiry_service.process_expired_certificates(source='manual')
         return jsonify(results)
+    except ExpiryCheckConflictException as e:
+        return jsonify({'error': str(e), 'conflict': True}), 409
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -528,6 +509,107 @@ def search_certificates():
 
     return jsonify(results)
 
+@app.route('/api/users', methods=['GET'])
+def list_users():
+    users = UserService.list_users()
+    return jsonify([user.to_dict() for user in users])
+
+@app.route('/api/users', methods=['POST'])
+def create_user():
+    data = request.json
+    username = data.get('username')
+    role = data.get('role', 'operator')
+
+    if not username:
+        return jsonify({'error': 'Username is required'}), 400
+
+    try:
+        user = UserService.create_user(username, role)
+        return jsonify(user.to_dict()), 201
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+
+@app.route('/api/users/<username>', methods=['GET'])
+def get_user(username):
+    user = UserService.get_user(username)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    return jsonify(user.to_dict())
+
+@app.route('/api/users/<username>/role', methods=['PUT'])
+def update_user_role(username):
+    data = request.json
+    new_role = data.get('role')
+
+    if not new_role:
+        return jsonify({'error': 'Role is required'}), 400
+
+    try:
+        user = UserService.update_user_role(username, new_role)
+        return jsonify(user.to_dict())
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+
+@app.route('/api/config/expiry-check-interval', methods=['GET'])
+def get_expiry_check_interval():
+    config_service = ConfigService()
+    return jsonify({
+        'expiry_check_interval_hours': config_service.get_expiry_check_interval_hours(),
+        'last_check_time': config_service.get_last_expiry_check_time(),
+        'check_in_progress': config_service.get_expiry_check_in_progress()
+    })
+
+@app.route('/api/config/expiry-check-interval', methods=['PUT'])
+def set_expiry_check_interval():
+    data = request.json
+    hours = data.get('hours')
+
+    if not hours or not isinstance(hours, (int, float)) or hours <= 0:
+        return jsonify({'error': 'Hours must be a positive number'}), 400
+
+    config_service = ConfigService()
+    config_service.set_expiry_check_interval_hours(hours)
+    return jsonify({'expiry_check_interval_hours': hours})
+
+@app.route('/api/scheduler/status', methods=['GET'])
+def get_scheduler_status():
+    status = ScheduledTaskService.get_scheduler_status()
+    return jsonify(status)
+
+@app.route('/api/scheduler/start', methods=['POST'])
+def start_scheduler():
+    ScheduledTaskService.start_scheduler(app)
+    return jsonify({'message': 'Scheduler started'})
+
+@app.route('/api/scheduler/stop', methods=['POST'])
+def stop_scheduler():
+    ScheduledTaskService.stop_scheduler()
+    return jsonify({'message': 'Scheduler stopped'})
+
+@app.route('/api/audit', methods=['GET'])
+def list_audit_logs():
+    certificate_id = request.args.get('certificate_id')
+    equipment_id = request.args.get('equipment_id')
+    batch_id = request.args.get('batch_id')
+    operator = request.args.get('operator')
+    action = request.args.get('action')
+
+    query = AuditLog.query
+
+    if certificate_id:
+        query = query.filter_by(certificate_id=int(certificate_id))
+    if equipment_id:
+        query = query.filter_by(equipment_id=int(equipment_id))
+    if batch_id:
+        query = query.filter_by(batch_id=batch_id)
+    if operator:
+        query = query.filter_by(operator=operator)
+    if action:
+        query = query.filter_by(action=action)
+
+    logs = query.order_by(AuditLog.timestamp.desc()).all()
+    return jsonify([log.to_dict() for log in logs])
+
 @app.errorhandler(404)
 def not_found(e):
     return jsonify({'error': 'Resource not found'}), 404
@@ -537,5 +619,22 @@ def internal_error(e):
     db.session.rollback()
     return jsonify({'error': 'Internal server error'}), 500
 
+@app.errorhandler(PermissionDeniedException)
+def handle_permission_denied(e):
+    return jsonify({
+        'error': e.message,
+        'required_role': e.required_role,
+        'operator_role': e.operator_role,
+        'action': e.action,
+        'resource_type': e.resource_type,
+        'resource_id': e.resource_id
+    }), 403
+
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    with app.app_context():
+        db.create_all()
+    ScheduledTaskService.start_scheduler(app)
+    try:
+        app.run(debug=True, host='0.0.0.0', port=5000)
+    finally:
+        ScheduledTaskService.stop_scheduler()
