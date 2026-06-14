@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-from models import db, Equipment, Certificate, AuditLog, WorkflowStatus, Report, ReportStatus
-from services import CertificateImportService, WorkflowService, ExportService, ExpiryWarningService, BatchStatsService, ConfigService, BatchWorkflowService, RevertService, ExpiryAutoTransitionService, CertificateSearchService, RolePermissionService, UserService, PermissionDeniedException, ExpiryCheckConflictException, ScheduledTaskService, ReportService, ReportGenerationConflictException, CertificateLockedException
+from models import db, Equipment, Certificate, AuditLog, WorkflowStatus, Report, ReportStatus, CalibrationTask, TaskStatus, TaskType
+from services import CertificateImportService, WorkflowService, ExportService, ExpiryWarningService, BatchStatsService, ConfigService, BatchWorkflowService, RevertService, ExpiryAutoTransitionService, CertificateSearchService, RolePermissionService, UserService, PermissionDeniedException, ExpiryCheckConflictException, ScheduledTaskService, ReportService, ReportGenerationConflictException, CertificateLockedException, CalibrationTaskService, TaskConflictException
 from validators import parse_csv_to_json
 import os
 import json
@@ -776,6 +776,314 @@ def handle_permission_denied(e):
         'resource_type': e.resource_type,
         'resource_id': e.resource_id
     }), 403
+
+
+@app.route('/api/tasks', methods=['POST'])
+def create_calibration_task():
+    data = request.json
+    operator = data.get('operator')
+    equipment_id = data.get('equipment_id')
+    task_type = data.get('task_type')
+    planned_date = data.get('planned_date')
+    calibrator = data.get('calibrator')
+    priority = data.get('priority', 0)
+    period_days = data.get('period_days')
+    force_override = data.get('force_override', False)
+    
+    if not operator:
+        return jsonify({'error': 'Operator is required'}), 400
+    if not equipment_id:
+        return jsonify({'error': 'Equipment ID is required'}), 400
+    if not task_type:
+        return jsonify({'error': 'Task type is required'}), 400
+    
+    from dateutil import parser
+    parsed_date = None
+    if planned_date:
+        try:
+            parsed_date = parser.parse(planned_date).date()
+        except:
+            return jsonify({'error': 'Invalid planned_date format'}), 400
+    
+    task_service = CalibrationTaskService()
+    
+    try:
+        task, error = task_service.create_task(
+            equipment_id=equipment_id,
+            task_type=task_type,
+            operator=operator,
+            planned_date=parsed_date,
+            calibrator=calibrator,
+            priority=priority,
+            period_days=period_days,
+            force_override=force_override
+        )
+        
+        if error:
+            return jsonify({'errors': error}), 400
+        
+        return jsonify(task), 201
+    except TaskConflictException as e:
+        return jsonify({
+            'error': e.message,
+            'conflict': True,
+            'conflicting_tasks': e.conflicting_tasks
+        }), 409
+    except PermissionDeniedException as e:
+        return jsonify({
+            'error': e.message,
+            'required_role': e.required_role,
+            'operator_role': e.operator_role
+        }), 403
+
+
+@app.route('/api/tasks/batch', methods=['POST'])
+def batch_create_calibration_tasks():
+    data = request.json
+    operator = data.get('operator')
+    equipment_ids = data.get('equipment_ids', [])
+    task_type = data.get('task_type')
+    planned_date = data.get('planned_date')
+    calibrator = data.get('calibrator')
+    priority = data.get('priority', 0)
+    force_override = data.get('force_override', False)
+    
+    if not operator:
+        return jsonify({'error': 'Operator is required'}), 400
+    if not equipment_ids or not isinstance(equipment_ids, list):
+        return jsonify({'error': 'equipment_ids must be a non-empty list'}), 400
+    if not task_type:
+        return jsonify({'error': 'Task type is required'}), 400
+    
+    from dateutil import parser
+    parsed_date = None
+    if planned_date:
+        try:
+            parsed_date = parser.parse(planned_date).date()
+        except:
+            pass
+    
+    task_service = CalibrationTaskService()
+    
+    try:
+        results = task_service.batch_create_tasks(
+            equipment_ids=equipment_ids,
+            task_type=task_type,
+            operator=operator,
+            planned_date=parsed_date,
+            calibrator=calibrator,
+            priority=priority,
+            force_override=force_override
+        )
+        return jsonify(results)
+    except PermissionDeniedException as e:
+        return jsonify({
+            'error': e.message,
+            'required_role': e.required_role,
+            'operator_role': e.operator_role
+        }), 403
+
+
+@app.route('/api/tasks', methods=['GET'])
+def search_calibration_tasks():
+    equipment_id = request.args.get('equipment_id', type=int)
+    status = request.args.get('status')
+    task_type = request.args.get('task_type')
+    calibrator = request.args.get('calibrator')
+    planned_date_from = request.args.get('planned_date_from')
+    planned_date_to = request.args.get('planned_date_to')
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 20, type=int)
+    
+    if page < 1:
+        page = 1
+    if per_page < 1 or per_page > 100:
+        per_page = 20
+    
+    filters = {}
+    if equipment_id:
+        filters['equipment_id'] = equipment_id
+    if status:
+        filters['status'] = status
+    if task_type:
+        filters['task_type'] = task_type
+    if calibrator:
+        filters['calibrator'] = calibrator
+    if planned_date_from:
+        filters['planned_date_from'] = planned_date_from
+    if planned_date_to:
+        filters['planned_date_to'] = planned_date_to
+    
+    task_service = CalibrationTaskService()
+    results = task_service.search_tasks(filters=filters if filters else None, page=page, per_page=per_page)
+    
+    return jsonify(results)
+
+
+@app.route('/api/tasks/<int:task_id>', methods=['GET'])
+def get_calibration_task(task_id):
+    task_service = CalibrationTaskService()
+    task = task_service.get_task(task_id)
+    
+    if not task:
+        return jsonify({'error': 'Task not found'}), 404
+    
+    return jsonify(task.to_dict())
+
+
+@app.route('/api/tasks/<int:task_id>/accept', methods=['POST'])
+def accept_calibration_task(task_id):
+    data = request.json
+    operator = data.get('operator')
+    
+    if not operator:
+        return jsonify({'error': 'Operator is required'}), 400
+    
+    task_service = CalibrationTaskService()
+    task, error = task_service.accept_task(task_id, operator)
+    
+    if error:
+        return jsonify({'errors': error}), 400
+    
+    return jsonify(task)
+
+
+@app.route('/api/tasks/<int:task_id>/start', methods=['POST'])
+def start_calibration_task(task_id):
+    data = request.json
+    operator = data.get('operator')
+    
+    if not operator:
+        return jsonify({'error': 'Operator is required'}), 400
+    
+    task_service = CalibrationTaskService()
+    task, error = task_service.start_task(task_id, operator)
+    
+    if error:
+        return jsonify({'errors': error}), 400
+    
+    return jsonify(task)
+
+
+@app.route('/api/tasks/<int:task_id>/complete', methods=['POST'])
+def complete_calibration_task(task_id):
+    data = request.json
+    operator = data.get('operator')
+    execution_notes = data.get('execution_notes')
+    measurement_data = data.get('measurement_data')
+    
+    if not operator:
+        return jsonify({'error': 'Operator is required'}), 400
+    
+    task_service = CalibrationTaskService()
+    
+    try:
+        task, error = task_service.complete_task(
+            task_id=task_id,
+            operator=operator,
+            execution_notes=execution_notes,
+            measurement_data=json.dumps(measurement_data) if measurement_data else None
+        )
+        
+        if error:
+            return jsonify({'errors': error}), 400
+        
+        return jsonify(task)
+    except PermissionDeniedException as e:
+        return jsonify({
+            'error': e.message,
+            'required_role': e.required_role,
+            'operator_role': e.operator_role
+        }), 403
+
+
+@app.route('/api/tasks/<int:task_id>/close', methods=['POST'])
+def close_calibration_task_abnormal(task_id):
+    data = request.json
+    operator = data.get('operator')
+    close_reason = data.get('close_reason')
+    
+    if not operator:
+        return jsonify({'error': 'Operator is required'}), 400
+    if not close_reason:
+        return jsonify({'error': 'Close reason is required'}), 400
+    
+    task_service = CalibrationTaskService()
+    
+    try:
+        task, error = task_service.close_task_abnormal(task_id, operator, close_reason)
+        
+        if error:
+            return jsonify({'errors': error}), 400
+        
+        return jsonify(task)
+    except PermissionDeniedException as e:
+        return jsonify({
+            'error': e.message,
+            'required_role': e.required_role,
+            'operator_role': e.operator_role
+        }), 403
+
+
+@app.route('/api/tasks/conflict/<int:equipment_id>', methods=['GET'])
+def check_task_conflict(equipment_id):
+    task_service = CalibrationTaskService()
+    conflicting_tasks = task_service.check_equipment_conflict(equipment_id)
+    
+    return jsonify({
+        'equipment_id': equipment_id,
+        'has_conflict': len(conflicting_tasks) > 0,
+        'conflicting_tasks': [{
+            'task_id': t.id,
+            'task_no': t.task_no,
+            'status': t.status,
+            'planned_date': t.planned_date.isoformat() if t.planned_date else None
+        } for t in conflicting_tasks]
+    })
+
+
+@app.route('/api/tasks/calibrator/<calibrator>', methods=['GET'])
+def get_tasks_by_calibrator(calibrator):
+    status = request.args.get('status')
+    
+    task_service = CalibrationTaskService()
+    tasks = task_service.get_tasks_by_calibrator(calibrator, status)
+    
+    return jsonify([task.to_dict() for task in tasks])
+
+
+@app.route('/api/config/scheduler', methods=['GET'])
+def get_scheduler_config():
+    config_service = ConfigService()
+    return jsonify(config_service.get_scheduler_config())
+
+
+@app.route('/api/config/scheduler', methods=['PUT'])
+def update_scheduler_config():
+    data = request.json
+    
+    if not data or not isinstance(data, dict):
+        return jsonify({'error': 'Request body must be a JSON object'}), 400
+    
+    config_service = ConfigService()
+    updated = {}
+    
+    for key, value in data.items():
+        updated[key] = config_service.set_scheduler_config(key, value)
+    
+    return jsonify({
+        'message': 'Scheduler config updated',
+        'updated': updated
+    })
+
+
+@app.errorhandler(TaskConflictException)
+def handle_task_conflict(e):
+    return jsonify({
+        'error': e.message,
+        'conflict': True,
+        'conflicting_tasks': e.conflicting_tasks
+    }), 409
 
 if __name__ == '__main__':
     with app.app_context():

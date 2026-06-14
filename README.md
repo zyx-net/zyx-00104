@@ -1069,3 +1069,81 @@ curl -X POST http://localhost:5000/api/certificates/expiry-process
 4. 完整执行工作流程：录入→复核→批准→放行
 5. 查看审计日志，确认记录完整
 6. 导出数据，验证格式正确
+
+## 校准任务调度模块
+
+### 功能概述
+
+校准任务调度模块用于管理校准任务的创建、分派、跟踪和完成，支持以下特性：
+
+- **任务类型**：周期循环任务、临时加急任务、批量派单任务
+- **状态流转**：待派发 → 已接单 → 执行中 → 已完成 → 异常关闭
+- **冲突检测**：同设备存在未完成任务时创建新任务会提示冲突
+- **强制覆盖**：允许主管强制覆盖冲突任务，操作记录审计日志且不可撤销
+- **审计日志**：每次状态切换都记录完整审计日志
+- **热加载**：调度策略配置支持文件监控热加载
+
+### API 端点
+
+#### 创建校准任务
+
+```bash
+curl -X POST http://localhost:5000/api/tasks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "operator": "Supervisor1",
+    "equipment_id": 1,
+    "task_type": "periodic",
+    "planned_date": "2026-07-01",
+    "calibrator": "Zhang San",
+    "priority": 5,
+    "period_days": 365
+  }'
+```
+
+#### 批量创建任务
+
+```bash
+curl -X POST http://localhost:5000/api/tasks/batch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "operator": "Supervisor1",
+    "equipment_ids": [1, 2, 3],
+    "task_type": "batch"
+  }'
+```
+
+#### 查询任务列表
+
+```bash
+curl "http://localhost:5000/api/tasks?status=pending&page=1&per_page=20"
+```
+
+#### 接单、开始、完成任务
+
+```bash
+curl -X POST http://localhost:5000/api/tasks/1/accept -d '{"operator": "Zhang San"}'
+curl -X POST http://localhost:5000/api/tasks/1/start -d '{"operator": "Zhang San"}'
+curl -X POST http://localhost:5000/api/tasks/1/complete -d '{"operator": "Supervisor1", "execution_notes": "Done"}'
+```
+
+#### 调度配置
+
+```json
+{
+  "scheduler": {
+    "default_priority": 0,
+    "urgent_priority": 10,
+    "auto_create_next_periodic": true,
+    "allow_force_override": true
+  }
+}
+```
+
+### 权限控制
+
+| 操作 | 录入员 | 计量员 | 主管 |
+|------|--------|--------|------|
+| 创建任务 | ✗ | ✗ | ✓ |
+| 接单/开始 | ✓ | ✓ | ✓ |
+| 完成/关闭 | ✗ | ✗ | ✓ |

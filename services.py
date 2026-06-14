@@ -1,4 +1,4 @@
-from models import db, Certificate, Equipment, AuditLog, WorkflowStatus, User, UserRole, Report, ReportStatus
+from models import db, Certificate, Equipment, AuditLog, WorkflowStatus, User, UserRole, Report, ReportStatus, CalibrationTask, TaskStatus, TaskType
 from validators import CertificateValidator, CertificateImportSchema, parse_csv_to_json
 from marshmallow import ValidationError
 from datetime import datetime, timedelta, date
@@ -234,6 +234,35 @@ class ConfigService:
         self._check_reload()
         report_config = self._config.get('report', {})
         return report_config.get('reload_interval_seconds', 5)
+
+    def get_scheduler_config(self):
+        self._check_reload()
+        return self._config.get('scheduler', {
+            'default_priority': 0,
+            'urgent_priority': 10,
+            'periodic_priority': 5,
+            'batch_priority': 3,
+            'auto_create_next_periodic': True,
+            'default_period_days': 365,
+            'task_reminder_days': 7,
+            'max_tasks_per_equipment': 1,
+            'allow_force_override': True,
+            'auto_reload': True,
+            'reload_interval_seconds': 5
+        })
+
+    def get_scheduler_reload_interval_seconds(self):
+        self._check_reload()
+        scheduler_config = self._config.get('scheduler', {})
+        return scheduler_config.get('reload_interval_seconds', 5)
+
+    def set_scheduler_config(self, key, value):
+        self._check_reload()
+        if 'scheduler' not in self._config:
+            self._config['scheduler'] = {}
+        self._config['scheduler'][key] = value
+        self._save_config()
+        return value
 
 class ExpiryWarningService:
     def get_expiring_certificates(self, days=None):
@@ -1365,6 +1394,459 @@ class ReportService:
         db.session.commit()
         
         return report.to_dict(), None
+
+
+class TaskConflictException(Exception):
+    def __init__(self, message, conflicting_tasks):
+        self.message = message
+        self.conflicting_tasks = conflicting_tasks
+        super().__init__(self.message)
+
+
+class CalibrationTaskService:
+    REQUIRED_ROLE_FOR_DISPATCH = UserRole.SUPERVISOR.value
+    REQUIRED_ROLE_FOR_CLOSE = UserRole.SUPERVISOR.value
+    
+    VALID_TRANSITIONS = {
+        TaskStatus.PENDING.value: [TaskStatus.ACCEPTED.value, TaskStatus.ABNORMAL_CLOSED.value],
+        TaskStatus.ACCEPTED.value: [TaskStatus.IN_PROGRESS.value, TaskStatus.ABNORMAL_CLOSED.value],
+        TaskStatus.IN_PROGRESS.value: [TaskStatus.COMPLETED.value, TaskStatus.ABNORMAL_CLOSED.value],
+        TaskStatus.COMPLETED.value: [],
+        TaskStatus.ABNORMAL_CLOSED.value: []
+    }
+    
+    INCOMPLETE_STATUSES = [
+        TaskStatus.PENDING.value,
+        TaskStatus.ACCEPTED.value,
+        TaskStatus.IN_PROGRESS.value
+    ]
+
+    def _generate_task_no(self, equipment, task_type):
+        import uuid
+        timestamp = datetime.utcnow().strftime('%Y%m%d%H%M%S')
+        unique_id = str(uuid.uuid4())[:8]
+        return f"TASK-{equipment.equipment_no}-{task_type[:3].upper()}-{timestamp}-{unique_id}"
+
+    def _check_permission(self, operator, action):
+        role = RolePermissionService.get_user_role(operator)
+        if action in ['dispatch', 'close']:
+            if role != self.REQUIRED_ROLE_FOR_DISPATCH:
+                raise PermissionDeniedException(
+                    message=f"Action '{action}' requires supervisor role, but user has role: {role}",
+                    required_role=[self.REQUIRED_ROLE_FOR_DISPATCH],
+                    operator_role=role,
+                    action=action,
+                    resource_type='calibration_task'
+                )
+        return True
+
+    def check_equipment_conflict(self, equipment_id, exclude_task_id=None):
+        query = CalibrationTask.query.filter(
+            CalibrationTask.equipment_id == equipment_id,
+            CalibrationTask.status.in_(self.INCOMPLETE_STATUSES)
+        )
+        if exclude_task_id:
+            query = query.filter(CalibrationTask.id != exclude_task_id)
+        return query.all()
+
+    def create_task(self, equipment_id, task_type, operator, planned_date=None, 
+                    calibrator=None, priority=0, period_days=None, force_override=False):
+        self._check_permission(operator, 'dispatch')
+        
+        equipment = Equipment.query.get(equipment_id)
+        if not equipment:
+            return None, [{'error': 'Equipment not found'}]
+        
+        if task_type not in [t.value for t in TaskType]:
+            return None, [{'error': f'Invalid task type: {task_type}'}]
+        
+        conflicting_tasks = self.check_equipment_conflict(equipment_id)
+        
+        if conflicting_tasks and not force_override:
+            conflict_info = [{
+                'task_id': t.id,
+                'task_no': t.task_no,
+                'status': t.status,
+                'planned_date': t.planned_date.isoformat() if t.planned_date else None
+            } for t in conflicting_tasks]
+            raise TaskConflictException(
+                message=f"Equipment {equipment_id} has {len(conflicting_tasks)} incomplete task(s)",
+                conflicting_tasks=conflict_info
+            )
+        
+        task_no = self._generate_task_no(equipment, task_type)
+        
+        task = CalibrationTask(
+            task_no=task_no,
+            equipment_id=equipment_id,
+            task_type=task_type,
+            status=TaskStatus.PENDING.value,
+            priority=priority,
+            planned_date=planned_date,
+            calibrator=calibrator,
+            assigned_by=operator,
+            assigned_at=datetime.utcnow(),
+            period_days=period_days if task_type == TaskType.PERIODIC.value else None,
+            version=1
+        )
+        
+        db.session.add(task)
+        db.session.flush()
+        
+        audit_details = {
+            'equipment_id': equipment_id,
+            'task_type': task_type,
+            'planned_date': planned_date.isoformat() if planned_date else None,
+            'calibrator': calibrator,
+            'priority': priority,
+            'period_days': period_days,
+            'force_override': force_override,
+            'conflict_resolved': len(conflicting_tasks) > 0
+        }
+        
+        audit = AuditLog(
+            operator=operator,
+            action='task_create',
+            resource_type='calibration_task',
+            resource_id=task.id,
+            equipment_id=equipment_id,
+            details=json.dumps(audit_details),
+            notes=f"Task created: {task_no}" + (f" (force override, {len(conflicting_tasks)} conflicts resolved)" if conflicting_tasks else ""),
+            version=1,
+            new_state=TaskStatus.PENDING.value
+        )
+        db.session.add(audit)
+        
+        if force_override and conflicting_tasks:
+            for conflict_task in conflicting_tasks:
+                conflict_task.status = TaskStatus.ABNORMAL_CLOSED.value
+                conflict_task.closed_by = operator
+                conflict_task.closed_at = datetime.utcnow()
+                conflict_task.close_reason = f"Overridden by new task {task_no}"
+                conflict_task.version += 1
+                
+                override_audit = AuditLog(
+                    operator=operator,
+                    action='task_force_override',
+                    resource_type='calibration_task',
+                    resource_id=conflict_task.id,
+                    equipment_id=equipment_id,
+                    notes=f"Task {conflict_task.task_no} overridden by {task_no}",
+                    decision_basis='Force override during new task creation',
+                    version=conflict_task.version,
+                    previous_state=TaskStatus.PENDING.value,
+                    new_state=TaskStatus.ABNORMAL_CLOSED.value
+                )
+                db.session.add(override_audit)
+        
+        db.session.commit()
+        return task.to_dict(), None
+
+    def batch_create_tasks(self, equipment_ids, task_type, operator, planned_date=None,
+                           calibrator=None, priority=0, force_override=False):
+        self._check_permission(operator, 'dispatch')
+        
+        results = {
+            'total': len(equipment_ids),
+            'successful': 0,
+            'failed': 0,
+            'results': [],
+            'overridden_tasks': []
+        }
+        
+        for eq_id in equipment_ids:
+            try:
+                task, error = self.create_task(
+                    equipment_id=eq_id,
+                    task_type=task_type,
+                    operator=operator,
+                    planned_date=planned_date,
+                    calibrator=calibrator,
+                    priority=priority,
+                    force_override=force_override
+                )
+                
+                if error:
+                    results['failed'] += 1
+                    results['results'].append({
+                        'equipment_id': eq_id,
+                        'success': False,
+                        'errors': error
+                    })
+                else:
+                    results['successful'] += 1
+                    results['results'].append({
+                        'equipment_id': eq_id,
+                        'task_id': task['id'],
+                        'task_no': task['task_no'],
+                        'success': True
+                    })
+            except TaskConflictException as e:
+                if force_override:
+                    results['successful'] += 1
+                    results['overridden_tasks'].extend(e.conflicting_tasks)
+                    results['results'].append({
+                        'equipment_id': eq_id,
+                        'success': True,
+                        'overridden': True,
+                        'overridden_tasks': e.conflicting_tasks
+                    })
+                else:
+                    results['failed'] += 1
+                    results['results'].append({
+                        'equipment_id': eq_id,
+                        'success': False,
+                        'conflict': True,
+                        'conflicting_tasks': e.conflicting_tasks
+                    })
+            except PermissionDeniedException as e:
+                results['failed'] += len(equipment_ids) - results['successful'] - results['failed']
+                return results
+            except Exception as e:
+                results['failed'] += 1
+                results['results'].append({
+                    'equipment_id': eq_id,
+                    'success': False,
+                    'errors': [{'error': str(e)}]
+                })
+        
+        return results
+
+    def accept_task(self, task_id, operator):
+        task = CalibrationTask.query.get(task_id)
+        if not task:
+            return None, [{'error': 'Task not found'}]
+        
+        if task.status != TaskStatus.PENDING.value:
+            return None, [{'error': f'Cannot accept task in {task.status} status'}]
+        
+        previous_status = task.status
+        task.status = TaskStatus.ACCEPTED.value
+        task.accepted_by = operator
+        task.accepted_at = datetime.utcnow()
+        task.version += 1
+        
+        audit = AuditLog(
+            operator=operator,
+            action='task_accept',
+            resource_type='calibration_task',
+            resource_id=task.id,
+            equipment_id=task.equipment_id,
+            notes=f"Task accepted by {operator}",
+            version=task.version,
+            previous_state=previous_status,
+            new_state=TaskStatus.ACCEPTED.value
+        )
+        db.session.add(audit)
+        
+        db.session.commit()
+        return task.to_dict(), None
+
+    def start_task(self, task_id, operator):
+        task = CalibrationTask.query.get(task_id)
+        if not task:
+            return None, [{'error': 'Task not found'}]
+        
+        if task.status != TaskStatus.ACCEPTED.value:
+            return None, [{'error': f'Cannot start task in {task.status} status'}]
+        
+        previous_status = task.status
+        task.status = TaskStatus.IN_PROGRESS.value
+        task.actual_start_time = datetime.utcnow()
+        task.version += 1
+        
+        audit = AuditLog(
+            operator=operator,
+            action='task_start',
+            resource_type='calibration_task',
+            resource_id=task.id,
+            equipment_id=task.equipment_id,
+            notes=f"Task started by {operator}",
+            version=task.version,
+            previous_state=previous_status,
+            new_state=TaskStatus.IN_PROGRESS.value
+        )
+        db.session.add(audit)
+        
+        db.session.commit()
+        return task.to_dict(), None
+
+    def complete_task(self, task_id, operator, execution_notes=None, measurement_data=None):
+        self._check_permission(operator, 'close')
+        
+        task = CalibrationTask.query.get(task_id)
+        if not task:
+            return None, [{'error': 'Task not found'}]
+        
+        if task.status != TaskStatus.IN_PROGRESS.value:
+            return None, [{'error': f'Cannot complete task in {task.status} status'}]
+        
+        previous_status = task.status
+        task.status = TaskStatus.COMPLETED.value
+        task.completed_by = operator
+        task.completed_at = datetime.utcnow()
+        task.actual_end_time = datetime.utcnow()
+        task.execution_notes = execution_notes
+        task.measurement_data = measurement_data
+        task.version += 1
+        
+        audit = AuditLog(
+            operator=operator,
+            action='task_complete',
+            resource_type='calibration_task',
+            resource_id=task.id,
+            equipment_id=task.equipment_id,
+            details=json.dumps({
+                'execution_notes': execution_notes,
+                'measurement_data': measurement_data
+            }),
+            notes=f"Task completed by {operator}",
+            version=task.version,
+            previous_state=previous_status,
+            new_state=TaskStatus.COMPLETED.value
+        )
+        db.session.add(audit)
+        
+        if task.task_type == TaskType.PERIODIC.value and task.period_days:
+            self._create_next_periodic_task(task, operator)
+        
+        db.session.commit()
+        return task.to_dict(), None
+
+    def close_task_abnormal(self, task_id, operator, close_reason):
+        self._check_permission(operator, 'close')
+        
+        task = CalibrationTask.query.get(task_id)
+        if not task:
+            return None, [{'error': 'Task not found'}]
+        
+        if task.status not in [TaskStatus.PENDING.value, TaskStatus.ACCEPTED.value, TaskStatus.IN_PROGRESS.value]:
+            return None, [{'error': f'Cannot close task in {task.status} status'}]
+        
+        previous_status = task.status
+        task.status = TaskStatus.ABNORMAL_CLOSED.value
+        task.closed_by = operator
+        task.closed_at = datetime.utcnow()
+        task.close_reason = close_reason
+        task.version += 1
+        
+        audit = AuditLog(
+            operator=operator,
+            action='task_close_abnormal',
+            resource_type='calibration_task',
+            resource_id=task.id,
+            equipment_id=task.equipment_id,
+            notes=f"Task abnormally closed by {operator}: {close_reason}",
+            decision_basis=close_reason,
+            version=task.version,
+            previous_state=previous_status,
+            new_state=TaskStatus.ABNORMAL_CLOSED.value
+        )
+        db.session.add(audit)
+        
+        db.session.commit()
+        return task.to_dict(), None
+
+    def _create_next_periodic_task(self, completed_task, operator):
+        from dateutil.relativedelta import relativedelta
+        
+        next_planned_date = None
+        if completed_task.planned_date and completed_task.period_days:
+            next_planned_date = completed_task.planned_date + timedelta(days=completed_task.period_days)
+        
+        equipment = completed_task.equipment
+        task_no = self._generate_task_no(equipment, TaskType.PERIODIC.value)
+        
+        next_task = CalibrationTask(
+            task_no=task_no,
+            equipment_id=completed_task.equipment_id,
+            task_type=TaskType.PERIODIC.value,
+            status=TaskStatus.PENDING.value,
+            priority=completed_task.priority,
+            planned_date=next_planned_date,
+            calibrator=completed_task.calibrator,
+            period_days=completed_task.period_days,
+            parent_task_id=completed_task.id,
+            version=1
+        )
+        
+        db.session.add(next_task)
+        db.session.flush()
+        
+        completed_task.next_task_id = next_task.id
+        
+        audit = AuditLog(
+            operator=operator,
+            action='task_create_periodic_next',
+            resource_type='calibration_task',
+            resource_id=next_task.id,
+            equipment_id=completed_task.equipment_id,
+            details=json.dumps({
+                'parent_task_id': completed_task.id,
+                'period_days': completed_task.period_days,
+                'next_planned_date': next_planned_date.isoformat() if next_planned_date else None
+            }),
+            notes=f"Next periodic task created: {task_no}",
+            version=1,
+            new_state=TaskStatus.PENDING.value
+        )
+        db.session.add(audit)
+
+    def get_task(self, task_id):
+        return CalibrationTask.query.get(task_id)
+
+    def get_tasks_by_equipment(self, equipment_id, status=None):
+        query = CalibrationTask.query.filter_by(equipment_id=equipment_id)
+        if status:
+            query = query.filter_by(status=status)
+        return query.order_by(CalibrationTask.created_at.desc()).all()
+
+    def get_tasks_by_calibrator(self, calibrator, status=None):
+        query = CalibrationTask.query.filter_by(calibrator=calibrator)
+        if status:
+            query = query.filter_by(status=status)
+        return query.order_by(CalibrationTask.planned_date).all()
+
+    def search_tasks(self, filters=None, page=1, per_page=20):
+        query = CalibrationTask.query
+        
+        if filters:
+            if filters.get('equipment_id'):
+                query = query.filter(CalibrationTask.equipment_id == filters['equipment_id'])
+            if filters.get('status'):
+                query = query.filter(CalibrationTask.status == filters['status'])
+            if filters.get('task_type'):
+                query = query.filter(CalibrationTask.task_type == filters['task_type'])
+            if filters.get('calibrator'):
+                query = query.filter(CalibrationTask.calibrator.ilike(f"%{filters['calibrator']}%"))
+            if filters.get('planned_date_from'):
+                try:
+                    from dateutil import parser
+                    date_from = parser.parse(filters['planned_date_from']).date()
+                    query = query.filter(CalibrationTask.planned_date >= date_from)
+                except:
+                    pass
+            if filters.get('planned_date_to'):
+                try:
+                    from dateutil import parser
+                    date_to = parser.parse(filters['planned_date_to']).date()
+                    query = query.filter(CalibrationTask.planned_date <= date_to)
+                except:
+                    pass
+        
+        query = query.order_by(CalibrationTask.priority.desc(), CalibrationTask.planned_date)
+        
+        pagination = query.paginate(page=page, per_page=per_page, error_out=False)
+        
+        return {
+            'items': [task.to_dict() for task in pagination.items],
+            'total': pagination.total,
+            'page': page,
+            'per_page': per_page,
+            'pages': pagination.pages,
+            'has_next': pagination.has_next,
+            'has_prev': pagination.has_prev
+        }
 
     def batch_generate_reports(self, certificate_ids, operator):
         self.check_generation_permission(operator)

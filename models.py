@@ -266,3 +266,86 @@ class ReportTemplate(db.Model):
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None
         }
+
+
+class TaskStatus(Enum):
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    ABNORMAL_CLOSED = "abnormal_closed"
+
+
+class TaskType(Enum):
+    PERIODIC = "periodic"
+    URGENT = "urgent"
+    BATCH = "batch"
+
+
+class CalibrationTask(db.Model):
+    __tablename__ = 'calibration_tasks'
+
+    id = db.Column(db.Integer, primary_key=True)
+    task_no = db.Column(db.String(100), unique=True, nullable=False, index=True)
+    equipment_id = db.Column(db.Integer, db.ForeignKey('equipment.id'), nullable=False)
+    task_type = db.Column(db.String(20), nullable=False)
+    status = db.Column(db.String(20), default=TaskStatus.PENDING.value)
+    priority = db.Column(db.Integer, default=0)
+    planned_date = db.Column(db.Date)
+    actual_start_time = db.Column(db.DateTime)
+    actual_end_time = db.Column(db.DateTime)
+    calibrator = db.Column(db.String(100))
+    assigned_by = db.Column(db.String(100))
+    assigned_at = db.Column(db.DateTime)
+    accepted_by = db.Column(db.String(100))
+    accepted_at = db.Column(db.DateTime)
+    completed_by = db.Column(db.String(100))
+    completed_at = db.Column(db.DateTime)
+    closed_by = db.Column(db.String(100))
+    closed_at = db.Column(db.DateTime)
+    execution_notes = db.Column(db.Text)
+    measurement_data = db.Column(db.Text)
+    close_reason = db.Column(db.Text)
+    period_days = db.Column(db.Integer)
+    next_task_id = db.Column(db.Integer, db.ForeignKey('calibration_tasks.id'))
+    parent_task_id = db.Column(db.Integer, db.ForeignKey('calibration_tasks.id'))
+    version = db.Column(db.Integer, default=1)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    equipment = db.relationship('Equipment', backref='calibration_tasks')
+    next_task = db.relationship('CalibrationTask', foreign_keys=[next_task_id], remote_side=[id])
+    parent_task = db.relationship('CalibrationTask', foreign_keys=[parent_task_id], remote_side=[id])
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'task_no': self.task_no,
+            'equipment_id': self.equipment_id,
+            'equipment_no': self.equipment.equipment_no if self.equipment else None,
+            'equipment_name': self.equipment.equipment_name if self.equipment else None,
+            'task_type': self.task_type,
+            'status': self.status,
+            'priority': self.priority,
+            'planned_date': self.planned_date.isoformat() if self.planned_date else None,
+            'actual_start_time': self.actual_start_time.isoformat() if self.actual_start_time else None,
+            'actual_end_time': self.actual_end_time.isoformat() if self.actual_end_time else None,
+            'calibrator': self.calibrator,
+            'assigned_by': self.assigned_by,
+            'assigned_at': self.assigned_at.isoformat() if self.assigned_at else None,
+            'accepted_by': self.accepted_by,
+            'accepted_at': self.accepted_at.isoformat() if self.accepted_at else None,
+            'completed_by': self.completed_by,
+            'completed_at': self.completed_at.isoformat() if self.completed_at else None,
+            'closed_by': self.closed_by,
+            'closed_at': self.closed_at.isoformat() if self.closed_at else None,
+            'execution_notes': self.execution_notes,
+            'measurement_data': self.measurement_data,
+            'close_reason': self.close_reason,
+            'period_days': self.period_days,
+            'next_task_id': self.next_task_id,
+            'parent_task_id': self.parent_task_id,
+            'version': self.version,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
