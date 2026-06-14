@@ -6,45 +6,6 @@ import json
 import os
 import time
 
-@pytest.fixture
-def client():
-    app.config['TESTING'] = True
-    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
-
-    with app.app_context():
-        db.session.remove()
-        db.drop_all()
-        db.create_all()
-        operator1 = User(username='Operator1', role='operator')
-        operator2 = User(username='Operator2', role='operator')
-        metrologist1 = User(username='Metrologist1', role='metrologist')
-        supervisor1 = User(username='Supervisor1', role='supervisor')
-        supervisor2 = User(username='Supervisor2', role='supervisor')
-        admin1 = User(username='Admin1', role='supervisor')
-        db.session.add_all([operator1, operator2, metrologist1, supervisor1, supervisor2, admin1])
-        db.session.commit()
-        yield app.test_client()
-        db.session.remove()
-        db.drop_all()
-
-@pytest.fixture
-def sample_equipment(client):
-    with app.app_context():
-        equipment = Equipment(
-            equipment_no='EQ-TEST-001',
-            equipment_name='Test Equipment',
-            model_spec='TEST-100',
-            manufacturer='Test Corp',
-            range_min=0,
-            range_max=100,
-            unit='V',
-            tolerance=0.05,
-            location='Lab 1'
-        )
-        db.session.add(equipment)
-        db.session.commit()
-        return equipment.id
-
 def test_health_check(client):
     response = client.get('/api/health')
     assert response.status_code == 200

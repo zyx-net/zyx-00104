@@ -8,28 +8,6 @@ import time
 
 
 @pytest.fixture
-def client():
-    app.config['TESTING'] = True
-    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
-
-    with app.app_context():
-        db.session.remove()
-        db.drop_all()
-        db.create_all()
-        operator1 = User(username='Operator1', role='operator')
-        operator2 = User(username='Operator2', role='operator')
-        metrologist1 = User(username='Metrologist1', role='metrologist')
-        metrologist2 = User(username='Metrologist2', role='metrologist')
-        supervisor1 = User(username='Supervisor1', role='supervisor')
-        supervisor2 = User(username='Supervisor2', role='supervisor')
-        db.session.add_all([operator1, operator2, metrologist1, metrologist2, supervisor1, supervisor2])
-        db.session.commit()
-        yield app.test_client()
-        db.session.remove()
-        db.drop_all()
-
-
-@pytest.fixture
 def sample_data(client):
     with app.app_context():
         eq1 = Equipment(

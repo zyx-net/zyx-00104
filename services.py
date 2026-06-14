@@ -2369,6 +2369,7 @@ class AuditService:
         return config.get('audit', {
             'retention_days': 90,
             'export_max_rows': 10000,
+            'export_time_range_days': 365,
             'auto_reload': True,
             'reload_interval_seconds': 5,
             'archive_time_hour': 3
@@ -2379,6 +2380,9 @@ class AuditService:
 
     def _get_export_max_rows(self):
         return self._get_audit_config().get('export_max_rows', 10000)
+
+    def _get_export_time_range_days(self):
+        return self._get_audit_config().get('export_time_range_days', 365)
 
     def check_query_permission(self, operator):
         role = RolePermissionService.get_user_role(operator)
@@ -2506,6 +2510,12 @@ class AuditService:
         self.check_export_permission(operator)
 
         query = self._build_query(filters)
+        
+        time_range_days = self._get_export_time_range_days()
+        if time_range_days > 0:
+            cutoff_time = datetime.now(timezone.utc) - timedelta(days=time_range_days)
+            query = query.filter(AuditLog.timestamp >= cutoff_time)
+        
         logs = query.limit(self._get_export_max_rows()).all()
 
         import io
@@ -2537,8 +2547,8 @@ class AuditService:
             operator=operator,
             action='audit_export',
             resource_type='audit',
-            notes=f"Exported {len(logs)} audit logs to CSV",
-            details=json.dumps({'filters': filters, 'row_count': len(logs)}),
+            notes=f"Exported {len(logs)} audit logs to CSV (time_range_days: {time_range_days})",
+            details=json.dumps({'filters': filters, 'row_count': len(logs), 'time_range_days': time_range_days}),
             version=1
         )
         db.session.add(audit)

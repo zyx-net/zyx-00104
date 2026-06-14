@@ -4,10 +4,48 @@
   "audit": {
     "retention_days": 90,
     "export_max_rows": 10000,
+    "export_time_range_days": 365,
     "auto_reload": true,
     "reload_interval_seconds": 5,
     "archive_time_hour": 3
   },
-  "expiry_check_in_progress": false,
-  "last_expiry_check_time": "2026-06-14T08:46:44.596573"
+  "scheduler": {
+    "default_priority": 0,
+    "urgent_priority": 10,
+    "periodic_priority": 5,
+    "batch_priority": 3,
+    "auto_create_next_periodic": true,
+    "default_period_days": 365,
+    "task_reminder_days": 7,
+    "max_tasks_per_equipment": 1,
+    "allow_force_override": true,
+    "auto_reload": true,
+    "reload_interval_seconds": 5
+  },
+  "statistics": {
+    "export_max_size_mb": 10,
+    "default_time_range_days": 90,
+    "auto_reload": true,
+    "reload_interval_seconds": 5
+  },
+  "report": {
+    "storage_path": "./reports",
+    "auto_reload": true,
+    "reload_interval_seconds": 5,
+    "template": {
+      "header": "\u6821\u51c6\u8bc1\u4e66\u62a5\u544a",
+      "footer": "\u8ba1\u91cf\u6821\u51c6\u4e2d\u5fc3"
+    },
+    "decision_rules": {
+      "qualified": {
+        "description": "\u5408\u683c"
+      },
+      "limited": {
+        "description": "\u9650\u7528"
+      },
+      "unqualified": {
+        "description": "\u4e0d\u5408\u683c"
+      }
+    }
+  }
 }

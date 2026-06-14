@@ -8,27 +8,7 @@ import os
 
 
 @pytest.fixture
-def client():
-    app.config['TESTING'] = True
-    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
-    
-    with app.app_context():
-        db.session.remove()
-        db.drop_all()
-        db.create_all()
-        operator1 = User(username='Operator1', role='operator')
-        metrologist1 = User(username='Metrologist1', role='metrologist')
-        supervisor1 = User(username='Supervisor1', role='supervisor')
-        supervisor2 = User(username='Supervisor2', role='supervisor')
-        db.session.add_all([operator1, metrologist1, supervisor1, supervisor2])
-        db.session.commit()
-        yield app.test_client()
-        db.session.remove()
-        db.drop_all()
-
-
-@pytest.fixture
-def sample_equipment(client):
+def sample_equipment_task(client):
     with app.app_context():
         equipment = Equipment(
             equipment_no='EQ-TASK-001',
@@ -47,7 +27,7 @@ def sample_equipment(client):
 
 
 @pytest.fixture
-def sample_equipment2(client):
+def sample_equipment_task2(client):
     with app.app_context():
         equipment = Equipment(
             equipment_no='EQ-TASK-002',
@@ -65,11 +45,11 @@ def sample_equipment2(client):
         return equipment.id
 
 
-def test_create_task_permission_denied_for_operator(client, sample_equipment):
+def test_create_task_permission_denied_for_operator(client, sample_equipment_task):
     response = client.post('/api/tasks',
         data=json.dumps({
             'operator': 'Operator1',
-            'equipment_id': sample_equipment,
+            'equipment_id': sample_equipment_task,
             'task_type': 'periodic'
         }),
         content_type='application/json'
@@ -80,11 +60,11 @@ def test_create_task_permission_denied_for_operator(client, sample_equipment):
     assert data['required_role'] == ['supervisor']
 
 
-def test_create_task_permission_denied_for_metrologist(client, sample_equipment):
+def test_create_task_permission_denied_for_metrologist(client, sample_equipment_task):
     response = client.post('/api/tasks',
         data=json.dumps({
             'operator': 'Metrologist1',
-            'equipment_id': sample_equipment,
+            'equipment_id': sample_equipment_task,
             'task_type': 'periodic'
         }),
         content_type='application/json'
@@ -94,11 +74,11 @@ def test_create_task_permission_denied_for_metrologist(client, sample_equipment)
     assert 'required_role' in data
 
 
-def test_create_periodic_task_success(client, sample_equipment):
+def test_create_periodic_task_success(client, sample_equipment_task):
     response = client.post('/api/tasks',
         data=json.dumps({
             'operator': 'Supervisor1',
-            'equipment_id': sample_equipment,
+            'equipment_id': sample_equipment_task,
             'task_type': 'periodic',
             'planned_date': '2026-07-01',
             'calibrator': 'Calibrator1',
@@ -116,11 +96,11 @@ def test_create_periodic_task_success(client, sample_equipment):
     assert 'task_no' in data
 
 
-def test_create_urgent_task_success(client, sample_equipment):
+def test_create_urgent_task_success(client, sample_equipment_task):
     response = client.post('/api/tasks',
         data=json.dumps({
             'operator': 'Supervisor1',
-            'equipment_id': sample_equipment,
+            'equipment_id': sample_equipment_task,
             'task_type': 'urgent',
             'priority': 10
         }),
@@ -132,11 +112,11 @@ def test_create_urgent_task_success(client, sample_equipment):
     assert data['priority'] == 10
 
 
-def test_create_batch_task_success(client, sample_equipment):
+def test_create_batch_task_success(client, sample_equipment_task):
     response = client.post('/api/tasks',
         data=json.dumps({
             'operator': 'Supervisor1',
-            'equipment_id': sample_equipment,
+            'equipment_id': sample_equipment_task,
             'task_type': 'batch',
             'priority': 3
         }),
@@ -161,11 +141,11 @@ def test_create_task_equipment_not_found(client):
     assert 'not found' in str(data['errors']).lower()
 
 
-def test_create_task_invalid_type(client, sample_equipment):
+def test_create_task_invalid_type(client, sample_equipment_task):
     response = client.post('/api/tasks',
         data=json.dumps({
             'operator': 'Supervisor1',
-            'equipment_id': sample_equipment,
+            'equipment_id': sample_equipment_task,
             'task_type': 'invalid_type'
         }),
         content_type='application/json'
@@ -175,11 +155,11 @@ def test_create_task_invalid_type(client, sample_equipment):
     assert 'invalid' in str(data['errors']).lower()
 
 
-def test_task_conflict_detection(client, sample_equipment):
+def test_task_conflict_detection(client, sample_equipment_task):
     response1 = client.post('/api/tasks',
         data=json.dumps({
             'operator': 'Supervisor1',
-            'equipment_id': sample_equipment,
+            'equipment_id': sample_equipment_task,
             'task_type': 'periodic'
         }),
         content_type='application/json'
@@ -189,7 +169,7 @@ def test_task_conflict_detection(client, sample_equipment):
     response2 = client.post('/api/tasks',
         data=json.dumps({
             'operator': 'Supervisor1',
-            'equipment_id': sample_equipment,
+            'equipment_id': sample_equipment_task,
             'task_type': 'urgent'
         }),
         content_type='application/json'
@@ -200,11 +180,11 @@ def test_task_conflict_detection(client, sample_equipment):
     assert len(data['conflicting_tasks']) == 1
 
 
-def test_task_force_override(client, sample_equipment):
+def test_task_force_override(client, sample_equipment_task):
     response1 = client.post('/api/tasks',
         data=json.dumps({
             'operator': 'Supervisor1',
-            'equipment_id': sample_equipment,
+            'equipment_id': sample_equipment_task,
             'task_type': 'periodic'
         }),
         content_type='application/json'
@@ -216,7 +196,7 @@ def test_task_force_override(client, sample_equipment):
     response2 = client.post('/api/tasks',
         data=json.dumps({
             'operator': 'Supervisor1',
-            'equipment_id': sample_equipment,
+            'equipment_id': sample_equipment_task,
             'task_type': 'urgent',
             'force_override': True
         }),
@@ -231,11 +211,11 @@ def test_task_force_override(client, sample_equipment):
     assert 'Overridden' in task_data['close_reason']
 
 
-def test_task_force_override_audit_log(client, sample_equipment):
+def test_task_force_override_audit_log(client, sample_equipment_task):
     response1 = client.post('/api/tasks',
         data=json.dumps({
             'operator': 'Supervisor1',
-            'equipment_id': sample_equipment,
+            'equipment_id': sample_equipment_task,
             'task_type': 'periodic'
         }),
         content_type='application/json'
@@ -246,7 +226,7 @@ def test_task_force_override_audit_log(client, sample_equipment):
     client.post('/api/tasks',
         data=json.dumps({
             'operator': 'Supervisor1',
-            'equipment_id': sample_equipment,
+            'equipment_id': sample_equipment_task,
             'task_type': 'urgent',
             'force_override': True
         }),
@@ -262,11 +242,11 @@ def test_task_force_override_audit_log(client, sample_equipment):
     assert override_logs[0]['new_state'] == 'abnormal_closed'
 
 
-def test_batch_create_tasks(client, sample_equipment, sample_equipment2):
+def test_batch_create_tasks(client, sample_equipment_task, sample_equipment_task2):
     response = client.post('/api/tasks/batch',
         data=json.dumps({
             'operator': 'Supervisor1',
-            'equipment_ids': [sample_equipment, sample_equipment2],
+            'equipment_ids': [sample_equipment_task, sample_equipment_task2],
             'task_type': 'batch'
         }),
         content_type='application/json'
@@ -278,11 +258,11 @@ def test_batch_create_tasks(client, sample_equipment, sample_equipment2):
     assert data['failed'] == 0
 
 
-def test_batch_create_tasks_permission_denied(client, sample_equipment, sample_equipment2):
+def test_batch_create_tasks_permission_denied(client, sample_equipment_task, sample_equipment_task2):
     response = client.post('/api/tasks/batch',
         data=json.dumps({
             'operator': 'Operator1',
-            'equipment_ids': [sample_equipment, sample_equipment2],
+            'equipment_ids': [sample_equipment_task, sample_equipment_task2],
             'task_type': 'batch'
         }),
         content_type='application/json'
@@ -290,11 +270,11 @@ def test_batch_create_tasks_permission_denied(client, sample_equipment, sample_e
     assert response.status_code == 403
 
 
-def test_accept_task_success(client, sample_equipment):
+def test_accept_task_success(client, sample_equipment_task):
     create_response = client.post('/api/tasks',
         data=json.dumps({
             'operator': 'Supervisor1',
-            'equipment_id': sample_equipment,
+            'equipment_id': sample_equipment_task,
             'task_type': 'periodic'
         }),
         content_type='application/json'
@@ -311,11 +291,11 @@ def test_accept_task_success(client, sample_equipment):
     assert data['accepted_by'] == 'Calibrator1'
 
 
-def test_accept_task_wrong_status(client, sample_equipment):
+def test_accept_task_wrong_status(client, sample_equipment_task):
     create_response = client.post('/api/tasks',
         data=json.dumps({
             'operator': 'Supervisor1',
-            'equipment_id': sample_equipment,
+            'equipment_id': sample_equipment_task,
             'task_type': 'periodic'
         }),
         content_type='application/json'
@@ -334,11 +314,11 @@ def test_accept_task_wrong_status(client, sample_equipment):
     assert accept_again.status_code == 400
 
 
-def test_start_task_success(client, sample_equipment):
+def test_start_task_success(client, sample_equipment_task):
     create_response = client.post('/api/tasks',
         data=json.dumps({
             'operator': 'Supervisor1',
-            'equipment_id': sample_equipment,
+            'equipment_id': sample_equipment_task,
             'task_type': 'periodic'
         }),
         content_type='application/json'
@@ -360,11 +340,11 @@ def test_start_task_success(client, sample_equipment):
     assert data['actual_start_time'] is not None
 
 
-def test_start_task_wrong_status(client, sample_equipment):
+def test_start_task_wrong_status(client, sample_equipment_task):
     create_response = client.post('/api/tasks',
         data=json.dumps({
             'operator': 'Supervisor1',
-            'equipment_id': sample_equipment,
+            'equipment_id': sample_equipment_task,
             'task_type': 'periodic'
         }),
         content_type='application/json'
@@ -378,11 +358,11 @@ def test_start_task_wrong_status(client, sample_equipment):
     assert start_response.status_code == 400
 
 
-def test_complete_task_permission_denied(client, sample_equipment):
+def test_complete_task_permission_denied(client, sample_equipment_task):
     create_response = client.post('/api/tasks',
         data=json.dumps({
             'operator': 'Supervisor1',
-            'equipment_id': sample_equipment,
+            'equipment_id': sample_equipment_task,
             'task_type': 'periodic'
         }),
         content_type='application/json'
@@ -408,11 +388,11 @@ def test_complete_task_permission_denied(client, sample_equipment):
     assert complete_response.status_code == 403
 
 
-def test_complete_task_success(client, sample_equipment):
+def test_complete_task_success(client, sample_equipment_task):
     create_response = client.post('/api/tasks',
         data=json.dumps({
             'operator': 'Supervisor1',
-            'equipment_id': sample_equipment,
+            'equipment_id': sample_equipment_task,
             'task_type': 'periodic',
             'period_days': 365
         }),
@@ -444,11 +424,11 @@ def test_complete_task_success(client, sample_equipment):
     assert data['measurement_data'] is not None
 
 
-def test_complete_task_creates_next_periodic(client, sample_equipment):
+def test_complete_task_creates_next_periodic(client, sample_equipment_task):
     create_response = client.post('/api/tasks',
         data=json.dumps({
             'operator': 'Supervisor1',
-            'equipment_id': sample_equipment,
+            'equipment_id': sample_equipment_task,
             'task_type': 'periodic',
             'period_days': 365,
             'planned_date': '2026-07-01'
@@ -473,7 +453,7 @@ def test_complete_task_creates_next_periodic(client, sample_equipment):
         content_type='application/json'
     )
     
-    search_response = client.get(f'/api/tasks?equipment_id={sample_equipment}')
+    search_response = client.get(f'/api/tasks?equipment_id={sample_equipment_task}')
     search_data = json.loads(search_response.data)
     
     assert search_data['total'] == 2
@@ -486,11 +466,11 @@ def test_complete_task_creates_next_periodic(client, sample_equipment):
     assert next_task['parent_task_id'] == completed_task['id']
 
 
-def test_close_task_abnormal_permission_denied(client, sample_equipment):
+def test_close_task_abnormal_permission_denied(client, sample_equipment_task):
     create_response = client.post('/api/tasks',
         data=json.dumps({
             'operator': 'Supervisor1',
-            'equipment_id': sample_equipment,
+            'equipment_id': sample_equipment_task,
             'task_type': 'periodic'
         }),
         content_type='application/json'
@@ -507,11 +487,11 @@ def test_close_task_abnormal_permission_denied(client, sample_equipment):
     assert close_response.status_code == 403
 
 
-def test_close_task_abnormal_success(client, sample_equipment):
+def test_close_task_abnormal_success(client, sample_equipment_task):
     create_response = client.post('/api/tasks',
         data=json.dumps({
             'operator': 'Supervisor1',
-            'equipment_id': sample_equipment,
+            'equipment_id': sample_equipment_task,
             'task_type': 'periodic'
         }),
         content_type='application/json'
@@ -531,11 +511,11 @@ def test_close_task_abnormal_success(client, sample_equipment):
     assert data['close_reason'] == 'Equipment sent for repair'
 
 
-def test_task_status_flow_audit_logs(client, sample_equipment):
+def test_task_status_flow_audit_logs(client, sample_equipment_task):
     create_response = client.post('/api/tasks',
         data=json.dumps({
             'operator': 'Supervisor1',
-            'equipment_id': sample_equipment,
+            'equipment_id': sample_equipment_task,
             'task_type': 'periodic'
         }),
         content_type='application/json'
@@ -576,11 +556,11 @@ def test_task_status_flow_audit_logs(client, sample_equipment):
         assert log['new_state'] is not None
 
 
-def test_complete_task_data_persistence(client, sample_equipment):
+def test_complete_task_data_persistence(client, sample_equipment_task):
     create_response = client.post('/api/tasks',
         data=json.dumps({
             'operator': 'Supervisor1',
-            'equipment_id': sample_equipment,
+            'equipment_id': sample_equipment_task,
             'task_type': 'periodic'
         }),
         content_type='application/json'
@@ -624,11 +604,11 @@ def test_complete_task_data_persistence(client, sample_equipment):
     assert saved_data['temperature'] == 23.5
 
 
-def test_search_tasks_by_status(client, sample_equipment):
+def test_search_tasks_by_status(client, sample_equipment_task):
     client.post('/api/tasks',
         data=json.dumps({
             'operator': 'Supervisor1',
-            'equipment_id': sample_equipment,
+            'equipment_id': sample_equipment_task,
             'task_type': 'periodic'
         }),
         content_type='application/json'
@@ -642,11 +622,11 @@ def test_search_tasks_by_status(client, sample_equipment):
         assert item['status'] == 'pending'
 
 
-def test_search_tasks_by_type(client, sample_equipment):
+def test_search_tasks_by_type(client, sample_equipment_task):
     client.post('/api/tasks',
         data=json.dumps({
             'operator': 'Supervisor1',
-            'equipment_id': sample_equipment,
+            'equipment_id': sample_equipment_task,
             'task_type': 'urgent'
         }),
         content_type='application/json'
@@ -659,13 +639,13 @@ def test_search_tasks_by_type(client, sample_equipment):
         assert item['task_type'] == 'urgent'
 
 
-def test_search_tasks_pagination(client, sample_equipment):
+def test_search_tasks_pagination(client, sample_equipment_task):
     task_ids = []
     for i in range(25):
         response = client.post('/api/tasks',
             data=json.dumps({
                 'operator': 'Supervisor1',
-                'equipment_id': sample_equipment,
+                'equipment_id': sample_equipment_task,
                 'task_type': 'periodic',
                 'force_override': True
             }),
@@ -724,28 +704,28 @@ def test_scheduler_config_hot_reload(client):
     assert get_data['default_period_days'] == 180
 
 
-def test_check_task_conflict_endpoint(client, sample_equipment):
+def test_check_task_conflict_endpoint(client, sample_equipment_task):
     client.post('/api/tasks',
         data=json.dumps({
             'operator': 'Supervisor1',
-            'equipment_id': sample_equipment,
+            'equipment_id': sample_equipment_task,
             'task_type': 'periodic'
         }),
         content_type='application/json'
     )
     
-    response = client.get(f'/api/tasks/conflict/{sample_equipment}')
+    response = client.get(f'/api/tasks/conflict/{sample_equipment_task}')
     assert response.status_code == 200
     data = json.loads(response.data)
     assert data['has_conflict'] == True
     assert len(data['conflicting_tasks']) == 1
 
 
-def test_get_tasks_by_calibrator(client, sample_equipment):
+def test_get_tasks_by_calibrator(client, sample_equipment_task):
     client.post('/api/tasks',
         data=json.dumps({
             'operator': 'Supervisor1',
-            'equipment_id': sample_equipment,
+            'equipment_id': sample_equipment_task,
             'task_type': 'periodic',
             'calibrator': 'TestCalibrator'
         }),
@@ -765,11 +745,11 @@ def test_task_not_found(client):
     assert response.status_code == 404
 
 
-def test_task_audit_log_correctness(client, sample_equipment):
+def test_task_audit_log_correctness(client, sample_equipment_task):
     create_response = client.post('/api/tasks',
         data=json.dumps({
             'operator': 'Supervisor1',
-            'equipment_id': sample_equipment,
+            'equipment_id': sample_equipment_task,
             'task_type': 'periodic',
             'planned_date': '2026-07-15'
         }),
@@ -784,8 +764,8 @@ def test_task_audit_log_correctness(client, sample_equipment):
     assert create_log is not None
     assert create_log['operator'] == 'Supervisor1'
     assert create_log['resource_type'] == 'calibration_task'
-    assert create_log['equipment_id'] == sample_equipment
+    assert create_log['equipment_id'] == sample_equipment_task
     
     details = json.loads(create_log['details'])
     assert details['task_type'] == 'periodic'
-    assert details['equipment_id'] == sample_equipment
+    assert details['equipment_id'] == sample_equipment_task
