@@ -1035,3 +1035,478 @@ def test_export_by_batch_with_date_range(client, sample_equipment):
     data = json.loads(response.data)
     assert len(data) == 1
     assert data[0]['cert_no'] == 'CERT-BATCH-DATE-001'
+
+
+def test_batch_approve_empty_list(client):
+    """测试批量审批空列表"""
+    response = client.post('/api/certificates/batch/approve',
+        data=json.dumps({
+            'operator': 'Supervisor1',
+            'certificate_ids': []
+        }),
+        content_type='application/json'
+    )
+    assert response.status_code == 400
+    data = json.loads(response.data)
+    assert 'empty' in data['error'].lower()
+
+
+def test_batch_approve_mixed_states(client, sample_equipment):
+    """测试批量审批混合状态证书"""
+    cert_ids = []
+    with app.app_context():
+        for i in range(3):
+            cert = Certificate(
+                cert_no=f'CERT-BATCH-APPROVE-{int(time.time())}-{i}',
+                batch_id='BATCH-APPROVE-TEST',
+                equipment_id=sample_equipment,
+                calibration_date=datetime(2026, 1, 1).date(),
+                valid_until=datetime(2027, 1, 1).date(),
+                range_min=0,
+                range_max=100,
+                unit='V',
+                deviation=0.02
+            )
+            db.session.add(cert)
+            db.session.flush()
+            cert_ids.append(cert.id)
+        db.session.commit()
+
+    client.post(f'/api/certificates/{cert_ids[0]}/enter',
+        data=json.dumps({'operator': 'Operator1'}),
+        content_type='application/json'
+    )
+    client.post(f'/api/certificates/{cert_ids[0]}/review',
+        data=json.dumps({'operator': 'Metrologist1', 'decision_basis': 'OK'}),
+        content_type='application/json'
+    )
+
+    client.post(f'/api/certificates/{cert_ids[1]}/enter',
+        data=json.dumps({'operator': 'Operator1'}),
+        content_type='application/json'
+    )
+
+    response = client.post('/api/certificates/batch/approve',
+        data=json.dumps({
+            'operator': 'Supervisor1',
+            'certificate_ids': cert_ids,
+            'decision_basis': 'Batch approval test'
+        }),
+        content_type='application/json'
+    )
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    assert data['total'] == 3
+    assert data['successful'] == 1
+    assert data['failed'] == 2
+
+    successful_results = [r for r in data['results'] if r['success']]
+    failed_results = [r for r in data['results'] if not r['success']]
+    assert len(successful_results) == 1
+    assert len(failed_results) == 2
+
+
+def test_batch_release_mixed_states(client, sample_equipment):
+    """测试批量放行混合状态证书"""
+    cert_ids = []
+    with app.app_context():
+        for i in range(3):
+            cert = Certificate(
+                cert_no=f'CERT-BATCH-RELEASE-{int(time.time())}-{i}',
+                batch_id='BATCH-RELEASE-TEST',
+                equipment_id=sample_equipment,
+                calibration_date=datetime(2026, 1, 1).date(),
+                valid_until=datetime(2027, 1, 1).date(),
+                range_min=0,
+                range_max=100,
+                unit='V',
+                deviation=0.02
+            )
+            db.session.add(cert)
+            db.session.flush()
+            cert_ids.append(cert.id)
+        db.session.commit()
+
+    for cert_id in cert_ids[:2]:
+        client.post(f'/api/certificates/{cert_id}/enter',
+            data=json.dumps({'operator': 'Operator1'}),
+            content_type='application/json'
+        )
+        client.post(f'/api/certificates/{cert_id}/review',
+            data=json.dumps({'operator': 'Metrologist1', 'decision_basis': 'OK'}),
+            content_type='application/json'
+        )
+        client.post(f'/api/certificates/{cert_id}/approve',
+            data=json.dumps({'operator': 'Supervisor1', 'decision_basis': 'OK'}),
+            content_type='application/json'
+        )
+
+    response = client.post('/api/certificates/batch/release',
+        data=json.dumps({
+            'operator': 'Operator2',
+            'certificate_ids': cert_ids,
+            'decision_basis': 'Batch release test'
+        }),
+        content_type='application/json'
+    )
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    assert data['total'] == 3
+    assert data['successful'] == 2
+    assert data['failed'] == 1
+
+
+def test_batch_release_self_entry_blocked(client, sample_equipment):
+    """测试批量放行时录入员不能放行自己录入的证书"""
+    cert_ids = []
+    with app.app_context():
+        cert = Certificate(
+            cert_no=f'CERT-SELF-RELEASE-{int(time.time())}',
+            batch_id='BATCH-SELF-RELEASE',
+            equipment_id=sample_equipment,
+            calibration_date=datetime(2026, 1, 1).date(),
+            valid_until=datetime(2027, 1, 1).date(),
+            range_min=0,
+            range_max=100,
+            unit='V',
+            deviation=0.02
+        )
+        db.session.add(cert)
+        db.session.flush()
+        cert_ids.append(cert.id)
+        db.session.commit()
+
+    client.post(f'/api/certificates/{cert_ids[0]}/enter',
+        data=json.dumps({'operator': 'Operator1'}),
+        content_type='application/json'
+    )
+    client.post(f'/api/certificates/{cert_ids[0]}/review',
+        data=json.dumps({'operator': 'Metrologist1', 'decision_basis': 'OK'}),
+        content_type='application/json'
+    )
+    client.post(f'/api/certificates/{cert_ids[0]}/approve',
+        data=json.dumps({'operator': 'Supervisor1', 'decision_basis': 'OK'}),
+        content_type='application/json'
+    )
+
+    response = client.post('/api/certificates/batch/release',
+        data=json.dumps({
+            'operator': 'Operator1',
+            'certificate_ids': cert_ids,
+            'decision_basis': 'Try to release own entry'
+        }),
+        content_type='application/json'
+    )
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    assert data['successful'] == 0
+    assert data['failed'] == 1
+    assert any('cannot release their own entry' in str(r.get('errors', [])).lower() for r in data['results'])
+
+
+def test_revert_workflow_success(client, sample_equipment):
+    """测试成功撤销工作流变更"""
+    cert_id = setup_certificate_for_workflow(client)
+
+    client.post(f'/api/certificates/{cert_id}/enter',
+        data=json.dumps({'operator': 'Operator1'}),
+        content_type='application/json'
+    )
+    client.post(f'/api/certificates/{cert_id}/review',
+        data=json.dumps({'operator': 'Metrologist1', 'decision_basis': 'OK'}),
+        content_type='application/json'
+    )
+    client.post(f'/api/certificates/{cert_id}/approve',
+        data=json.dumps({'operator': 'Supervisor1', 'decision_basis': 'OK'}),
+        content_type='application/json'
+    )
+
+    cert_response = client.get(f'/api/certificates/{cert_id}')
+    cert_data = json.loads(cert_response.data)
+    assert cert_data['workflow_status'] == 'approved'
+
+    revert_response = client.post(f'/api/certificates/{cert_id}/revert',
+        data=json.dumps({
+            'operator': 'Admin1',
+            'notes': 'Revert to reviewed state'
+        }),
+        content_type='application/json'
+    )
+    assert revert_response.status_code == 200
+    reverted_data = json.loads(revert_response.data)
+    assert reverted_data['workflow_status'] == 'reviewed'
+
+
+def test_revert_restores_equipment_status(client, sample_equipment):
+    """测试撤销时恢复设备状态"""
+    cert_id = setup_certificate_for_workflow(client)
+
+    client.post(f'/api/certificates/{cert_id}/enter',
+        data=json.dumps({'operator': 'Operator1'}),
+        content_type='application/json'
+    )
+    client.post(f'/api/certificates/{cert_id}/review',
+        data=json.dumps({'operator': 'Metrologist1', 'decision_basis': 'OK'}),
+        content_type='application/json'
+    )
+    client.post(f'/api/certificates/{cert_id}/approve',
+        data=json.dumps({'operator': 'Supervisor1', 'decision_basis': 'OK'}),
+        content_type='application/json'
+    )
+    client.post(f'/api/certificates/{cert_id}/release',
+        data=json.dumps({'operator': 'Operator2', 'decision_basis': 'OK'}),
+        content_type='application/json'
+    )
+
+    cert_response = client.get(f'/api/certificates/{cert_id}')
+    cert_data = json.loads(cert_response.data)
+    equipment_id = cert_data['equipment_id']
+
+    eq_response = client.get(f'/api/equipment/{equipment_id}')
+    eq_data = json.loads(eq_response.data)
+    assert eq_data['status'] == 'active'
+
+    revert_response = client.post(f'/api/certificates/{cert_id}/revert',
+        data=json.dumps({
+            'operator': 'Admin1',
+            'notes': 'Revert release'
+        }),
+        content_type='application/json'
+    )
+    assert revert_response.status_code == 200
+
+    eq_response = client.get(f'/api/equipment/{equipment_id}')
+    eq_data = json.loads(eq_response.data)
+    assert eq_data['status'] == 'active'
+
+
+def test_revert_creates_audit_log(client, sample_equipment):
+    """测试撤销创建审计日志"""
+    cert_id = setup_certificate_for_workflow(client)
+
+    client.post(f'/api/certificates/{cert_id}/enter',
+        data=json.dumps({'operator': 'Operator1'}),
+        content_type='application/json'
+    )
+
+    revert_response = client.post(f'/api/certificates/{cert_id}/revert',
+        data=json.dumps({
+            'operator': 'Admin1',
+            'notes': 'Revert enter'
+        }),
+        content_type='application/json'
+    )
+    assert revert_response.status_code == 200
+
+    audit_response = client.get(f'/api/audit?certificate_id={cert_id}')
+    audit_data = json.loads(audit_response.data)
+
+    revert_logs = [log for log in audit_data if log['action'] == 'revert']
+    assert len(revert_logs) == 1
+    assert revert_logs[0]['operator'] == 'Admin1'
+    assert revert_logs[0]['previous_state'] == 'entered'
+    assert revert_logs[0]['new_state'] == 'draft'
+
+
+def test_revert_double_fails(client, sample_equipment):
+    """测试重复撤销同一变更失败"""
+    cert_id = setup_certificate_for_workflow(client)
+
+    client.post(f'/api/certificates/{cert_id}/enter',
+        data=json.dumps({'operator': 'Operator1'}),
+        content_type='application/json'
+    )
+
+    revert_response1 = client.post(f'/api/certificates/{cert_id}/revert',
+        data=json.dumps({
+            'operator': 'Admin1',
+            'notes': 'First revert'
+        }),
+        content_type='application/json'
+    )
+    assert revert_response1.status_code == 200
+
+    revert_response2 = client.post(f'/api/certificates/{cert_id}/revert',
+        data=json.dumps({
+            'operator': 'Admin1',
+            'notes': 'Second revert'
+        }),
+        content_type='application/json'
+    )
+    assert revert_response2.status_code == 400
+    data = json.loads(revert_response2.data)
+    assert any('no workflow change' in str(err).lower() for err in data['errors'])
+
+
+def test_revert_draft_fails(client, sample_equipment):
+    """测试撤销草稿状态失败"""
+    cert_id = setup_certificate_for_workflow(client)
+
+    revert_response = client.post(f'/api/certificates/{cert_id}/revert',
+        data=json.dumps({
+            'operator': 'Admin1',
+            'notes': 'Try to revert draft'
+        }),
+        content_type='application/json'
+    )
+    assert revert_response.status_code == 400
+    data = json.loads(revert_response.data)
+    assert any('no workflow change' in str(err).lower() for err in data['errors'])
+
+
+def test_revert_nonexistent_certificate(client):
+    """测试撤销不存在的证书"""
+    revert_response = client.post('/api/certificates/99999/revert',
+        data=json.dumps({
+            'operator': 'Admin1',
+            'notes': 'Try to revert nonexistent'
+        }),
+        content_type='application/json'
+    )
+    assert revert_response.status_code == 400
+    data = json.loads(revert_response.data)
+    assert any('not found' in str(err).lower() for err in data['errors'])
+
+
+def test_batch_approve_all_success(client, sample_equipment):
+    """测试批量审批全部成功"""
+    cert_ids = []
+    with app.app_context():
+        for i in range(3):
+            cert = Certificate(
+                cert_no=f'CERT-BATCH-ALL-{int(time.time())}-{i}',
+                batch_id='BATCH-ALL-TEST',
+                equipment_id=sample_equipment,
+                calibration_date=datetime(2026, 1, 1).date(),
+                valid_until=datetime(2027, 1, 1).date(),
+                range_min=0,
+                range_max=100,
+                unit='V',
+                deviation=0.02
+            )
+            db.session.add(cert)
+            db.session.flush()
+            cert_ids.append(cert.id)
+        db.session.commit()
+
+    for cert_id in cert_ids:
+        client.post(f'/api/certificates/{cert_id}/enter',
+            data=json.dumps({'operator': 'Operator1'}),
+            content_type='application/json'
+        )
+        client.post(f'/api/certificates/{cert_id}/review',
+            data=json.dumps({'operator': 'Metrologist1', 'decision_basis': 'OK'}),
+            content_type='application/json'
+        )
+
+    response = client.post('/api/certificates/batch/approve',
+        data=json.dumps({
+            'operator': 'Supervisor1',
+            'certificate_ids': cert_ids,
+            'decision_basis': 'All approved'
+        }),
+        content_type='application/json'
+    )
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    assert data['total'] == 3
+    assert data['successful'] == 3
+    assert data['failed'] == 0
+
+
+def test_batch_release_all_success(client, sample_equipment):
+    """测试批量放行全部成功"""
+    cert_ids = []
+    with app.app_context():
+        for i in range(3):
+            cert = Certificate(
+                cert_no=f'CERT-BATCH-RELEASE-ALL-{int(time.time())}-{i}',
+                batch_id='BATCH-RELEASE-ALL',
+                equipment_id=sample_equipment,
+                calibration_date=datetime(2026, 1, 1).date(),
+                valid_until=datetime(2027, 1, 1).date(),
+                range_min=0,
+                range_max=100,
+                unit='V',
+                deviation=0.02
+            )
+            db.session.add(cert)
+            db.session.flush()
+            cert_ids.append(cert.id)
+        db.session.commit()
+
+    for cert_id in cert_ids:
+        client.post(f'/api/certificates/{cert_id}/enter',
+            data=json.dumps({'operator': 'Operator1'}),
+            content_type='application/json'
+        )
+        client.post(f'/api/certificates/{cert_id}/review',
+            data=json.dumps({'operator': 'Metrologist1', 'decision_basis': 'OK'}),
+            content_type='application/json'
+        )
+        client.post(f'/api/certificates/{cert_id}/approve',
+            data=json.dumps({'operator': 'Supervisor1', 'decision_basis': 'OK'}),
+            content_type='application/json'
+        )
+
+    response = client.post('/api/certificates/batch/release',
+        data=json.dumps({
+            'operator': 'Operator2',
+            'certificate_ids': cert_ids,
+            'decision_basis': 'All released'
+        }),
+        content_type='application/json'
+    )
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    assert data['total'] == 3
+    assert data['successful'] == 3
+    assert data['failed'] == 0
+
+
+def test_batch_operations_no_rollback_on_failure(client, sample_equipment):
+    """测试批量操作失败不影响已成功的记录"""
+    cert_ids = []
+    with app.app_context():
+        for i in range(2):
+            cert = Certificate(
+                cert_no=f'CERT-NO-ROLLBACK-{int(time.time())}-{i}',
+                batch_id='BATCH-NO-ROLLBACK',
+                equipment_id=sample_equipment,
+                calibration_date=datetime(2026, 1, 1).date(),
+                valid_until=datetime(2027, 1, 1).date(),
+                range_min=0,
+                range_max=100,
+                unit='V',
+                deviation=0.02
+            )
+            db.session.add(cert)
+            db.session.flush()
+            cert_ids.append(cert.id)
+        db.session.commit()
+
+    client.post(f'/api/certificates/{cert_ids[0]}/enter',
+        data=json.dumps({'operator': 'Operator1'}),
+        content_type='application/json'
+    )
+    client.post(f'/api/certificates/{cert_ids[0]}/review',
+        data=json.dumps({'operator': 'Metrologist1', 'decision_basis': 'OK'}),
+        content_type='application/json'
+    )
+
+    response = client.post('/api/certificates/batch/approve',
+        data=json.dumps({
+            'operator': 'Supervisor1',
+            'certificate_ids': cert_ids,
+            'decision_basis': 'Test no rollback'
+        }),
+        content_type='application/json'
+    )
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    assert data['successful'] == 1
+    assert data['failed'] == 1
+
+    cert0_response = client.get(f'/api/certificates/{cert_ids[0]}')
+    cert0_data = json.loads(cert0_response.data)
+    assert cert0_data['workflow_status'] == 'approved'

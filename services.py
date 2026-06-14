@@ -340,6 +340,178 @@ class WorkflowService:
             self.errors.append({'error': str(e)})
             return False, self.errors
 
+class BatchWorkflowService:
+    def __init__(self):
+        self.workflow_service = WorkflowService()
+
+    def batch_approve(self, certificate_ids, operator, notes='', decision_basis=''):
+        results = {
+            'total': len(certificate_ids),
+            'successful': 0,
+            'failed': 0,
+            'results': []
+        }
+
+        for cert_id in certificate_ids:
+            success, errors = self.workflow_service.approve(cert_id, operator, notes, decision_basis)
+            cert = Certificate.query.get(cert_id)
+            
+            result_item = {
+                'certificate_id': cert_id,
+                'cert_no': cert.cert_no if cert else None,
+                'success': success
+            }
+            
+            if success:
+                results['successful'] += 1
+                result_item['workflow_status'] = cert.workflow_status
+            else:
+                results['failed'] += 1
+                result_item['errors'] = errors
+            
+            results['results'].append(result_item)
+
+        return results
+
+    def batch_release(self, certificate_ids, operator, notes='', decision_basis=''):
+        results = {
+            'total': len(certificate_ids),
+            'successful': 0,
+            'failed': 0,
+            'results': []
+        }
+
+        for cert_id in certificate_ids:
+            cert = Certificate.query.get(cert_id)
+            
+            if not cert:
+                results['failed'] += 1
+                results['results'].append({
+                    'certificate_id': cert_id,
+                    'cert_no': None,
+                    'success': False,
+                    'errors': [{'error': 'Certificate not found'}]
+                })
+                continue
+
+            if operator == cert.entered_by:
+                results['failed'] += 1
+                results['results'].append({
+                    'certificate_id': cert_id,
+                    'cert_no': cert.cert_no,
+                    'success': False,
+                    'errors': [{'error': 'Operator cannot release their own entry', 'field': 'operator'}]
+                })
+                continue
+
+            success, errors = self.workflow_service.release(cert_id, operator, notes, decision_basis)
+            
+            result_item = {
+                'certificate_id': cert_id,
+                'cert_no': cert.cert_no,
+                'success': success
+            }
+            
+            if success:
+                results['successful'] += 1
+                result_item['workflow_status'] = cert.workflow_status
+            else:
+                results['failed'] += 1
+                result_item['errors'] = errors
+            
+            results['results'].append(result_item)
+
+        return results
+
+
+class RevertService:
+    def revert_last_workflow_change(self, certificate_id, operator, notes=''):
+        cert = Certificate.query.get(certificate_id)
+        if not cert:
+            return False, [{'error': 'Certificate not found'}]
+
+        last_audit = AuditLog.query.filter(
+            AuditLog.certificate_id == certificate_id,
+            AuditLog.resource_type == 'certificate',
+            AuditLog.action.in_(['enter', 'review', 'approve', 'release', 'limit', 'stop']),
+            AuditLog.reverted == False
+        ).order_by(AuditLog.timestamp.desc()).first()
+
+        if not last_audit:
+            return False, [{'error': 'No workflow change to revert'}]
+
+        previous_status = last_audit.previous_state
+        if not previous_status:
+            return False, [{'error': 'Cannot determine previous state'}]
+
+        current_status = cert.workflow_status
+        cert.workflow_status = previous_status
+        cert.version += 1
+        cert.updated_at = datetime.utcnow()
+
+        if previous_status == WorkflowStatus.DRAFT.value:
+            cert.entered_by = None
+            cert.entered_at = None
+            cert.reviewed_by = None
+            cert.reviewed_at = None
+            cert.approved_by = None
+            cert.approved_at = None
+            cert.released_by = None
+            cert.released_at = None
+        elif previous_status == WorkflowStatus.ENTERED.value:
+            cert.reviewed_by = None
+            cert.reviewed_at = None
+            cert.approved_by = None
+            cert.approved_at = None
+            cert.released_by = None
+            cert.released_at = None
+        elif previous_status == WorkflowStatus.REVIEWED.value:
+            cert.approved_by = None
+            cert.approved_at = None
+            cert.released_by = None
+            cert.released_at = None
+        elif previous_status == WorkflowStatus.APPROVED.value:
+            cert.released_by = None
+            cert.released_at = None
+
+        if current_status in [WorkflowStatus.RELEASED.value, WorkflowStatus.LIMITED.value, WorkflowStatus.STOPPED.value]:
+            equipment_audit = AuditLog.query.filter(
+                AuditLog.certificate_id == certificate_id,
+                AuditLog.resource_type == 'equipment',
+                AuditLog.action.in_(['equipment_release', 'equipment_limit', 'equipment_stop'])
+            ).order_by(AuditLog.timestamp.desc()).first()
+
+            if equipment_audit and equipment_audit.previous_state:
+                cert.equipment.status = equipment_audit.previous_state
+
+        last_audit.reverted = True
+        last_audit.reverted_by = operator
+        last_audit.reverted_at = datetime.utcnow()
+
+        revert_audit = AuditLog(
+            operator=operator,
+            action='revert',
+            resource_type='certificate',
+            resource_id=cert.id,
+            certificate_id=cert.id,
+            batch_id=cert.batch_id,
+            notes=notes,
+            decision_basis=f'Reverted {last_audit.action} by {operator}',
+            version=cert.version,
+            previous_state=current_status,
+            new_state=previous_status,
+            revert_log_id=last_audit.id
+        )
+        db.session.add(revert_audit)
+
+        try:
+            db.session.commit()
+            return True, []
+        except Exception as e:
+            db.session.rollback()
+            return False, [{'error': str(e)}]
+
+
 class ExportService:
     def export_by_equipment(self, equipment_id, format='json', valid_from=None, valid_to=None):
         query = Certificate.query.filter_by(equipment_id=equipment_id)

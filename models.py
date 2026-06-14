@@ -134,6 +134,10 @@ class AuditLog(db.Model):
     version = db.Column(db.Integer, default=1)
     previous_state = db.Column(db.Text)
     new_state = db.Column(db.Text)
+    reverted = db.Column(db.Boolean, default=False)
+    reverted_by = db.Column(db.String(100))
+    reverted_at = db.Column(db.DateTime)
+    revert_log_id = db.Column(db.Integer, db.ForeignKey('audit_logs.id'))
 
     equipment = db.relationship('Equipment', back_populates='audit_logs')
     certificate = db.relationship('Certificate', back_populates='audit_logs')
@@ -154,5 +158,9 @@ class AuditLog(db.Model):
             'decision_basis': self.decision_basis,
             'version': self.version,
             'previous_state': self.previous_state,
-            'new_state': self.new_state
+            'new_state': self.new_state,
+            'reverted': self.reverted,
+            'reverted_by': self.reverted_by,
+            'reverted_at': self.reverted_at.isoformat() if self.reverted_at else None,
+            'revert_log_id': self.revert_log_id
         }

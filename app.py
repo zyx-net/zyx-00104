@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from models import db, Equipment, Certificate, AuditLog, WorkflowStatus
-from services import CertificateImportService, WorkflowService, ExportService, ExpiryWarningService, BatchStatsService, ConfigService
+from services import CertificateImportService, WorkflowService, ExportService, ExpiryWarningService, BatchStatsService, ConfigService, BatchWorkflowService, RevertService
 from validators import parse_csv_to_json
 import os
 import json
@@ -287,6 +287,68 @@ def stop_certificate(certificate_id):
 
     workflow_service = WorkflowService()
     success, errors = workflow_service.stop(certificate_id, operator, notes, decision_basis)
+
+    if success:
+        cert = Certificate.query.get(certificate_id)
+        return jsonify(cert.to_dict())
+    else:
+        return jsonify({'errors': errors}), 400
+
+@app.route('/api/certificates/batch/approve', methods=['POST'])
+def batch_approve_certificates():
+    data = request.json
+    certificate_ids = data.get('certificate_ids', [])
+    operator = data.get('operator')
+    notes = data.get('notes', '')
+    decision_basis = data.get('decision_basis', '')
+
+    if not operator:
+        return jsonify({'error': 'Operator is required'}), 400
+
+    if not certificate_ids:
+        return jsonify({'error': 'certificate_ids is required and cannot be empty'}), 400
+
+    if not isinstance(certificate_ids, list):
+        return jsonify({'error': 'certificate_ids must be a list'}), 400
+
+    batch_service = BatchWorkflowService()
+    results = batch_service.batch_approve(certificate_ids, operator, notes, decision_basis)
+
+    return jsonify(results)
+
+@app.route('/api/certificates/batch/release', methods=['POST'])
+def batch_release_certificates():
+    data = request.json
+    certificate_ids = data.get('certificate_ids', [])
+    operator = data.get('operator')
+    notes = data.get('notes', '')
+    decision_basis = data.get('decision_basis', '')
+
+    if not operator:
+        return jsonify({'error': 'Operator is required'}), 400
+
+    if not certificate_ids:
+        return jsonify({'error': 'certificate_ids is required and cannot be empty'}), 400
+
+    if not isinstance(certificate_ids, list):
+        return jsonify({'error': 'certificate_ids must be a list'}), 400
+
+    batch_service = BatchWorkflowService()
+    results = batch_service.batch_release(certificate_ids, operator, notes, decision_basis)
+
+    return jsonify(results)
+
+@app.route('/api/certificates/<int:certificate_id>/revert', methods=['POST'])
+def revert_certificate(certificate_id):
+    data = request.json
+    operator = data.get('operator')
+    notes = data.get('notes', '')
+
+    if not operator:
+        return jsonify({'error': 'Operator is required'}), 400
+
+    revert_service = RevertService()
+    success, errors = revert_service.revert_last_workflow_change(certificate_id, operator, notes)
 
     if success:
         cert = Certificate.query.get(certificate_id)

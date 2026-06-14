@@ -265,6 +265,148 @@ curl "http://localhost:5000/api/export/batch/BATCH-2024-001?format=csv" > batch_
 curl "http://localhost:5000/api/export/all" > all_certs.json
 ```
 
+### 批量操作
+
+#### 批量审批
+```bash
+curl -X POST http://localhost:5000/api/certificates/batch/approve \
+  -H "Content-Type: application/json" \
+  -d '{
+    "operator": "Supervisor1",
+    "certificate_ids": [1, 2, 3],
+    "notes": "Batch approval",
+    "decision_basis": "All certificates meet quality standards"
+  }'
+```
+
+响应示例（混合结果 - 部分成功部分失败）：
+```json
+{
+  "total": 3,
+  "successful": 2,
+  "failed": 1,
+  "results": [
+    {"certificate_id": 1, "cert_no": "CERT-001", "success": true, "workflow_status": "approved"},
+    {"certificate_id": 2, "cert_no": "CERT-002", "success": true, "workflow_status": "approved"},
+    {
+      "certificate_id": 3,
+      "cert_no": "CERT-003",
+      "success": false,
+      "errors": [{"error": "Invalid transition from draft to approved", "field": "workflow_status"}]
+    }
+  ]
+}
+```
+
+#### 批量放行
+```bash
+curl -X POST http://localhost:5000/api/certificates/batch/release \
+  -H "Content-Type: application/json" \
+  -d '{
+    "operator": "Operator2",
+    "certificate_ids": [1, 2, 3],
+    "notes": "Batch release",
+    "decision_basis": "All checks passed"
+  }'
+```
+
+响应示例（包含权限检查失败）：
+```json
+{
+  "total": 3,
+  "successful": 1,
+  "failed": 2,
+  "results": [
+    {"certificate_id": 1, "cert_no": "CERT-001", "success": true, "workflow_status": "released"},
+    {
+      "certificate_id": 2,
+      "cert_no": "CERT-002",
+      "success": false,
+      "errors": [{"error": "Operator cannot release their own entry", "field": "operator"}]
+    },
+    {
+      "certificate_id": 3,
+      "cert_no": "CERT-003",
+      "success": false,
+      "errors": [{"error": "Invalid transition from draft to released", "field": "workflow_status"}]
+    }
+  ]
+}
+```
+
+#### 批量操作特点
+- **非原子性**：每个证书独立处理，一个失败不影响其他
+- **权限检查**：放行时检查操作人是否为录入人
+- **状态验证**：只有处于审批通过(approved)状态的证书才能放行
+
+### 操作撤销
+
+#### 撤销最近工作流变更
+```bash
+curl -X POST http://localhost:5000/api/certificates/1/revert \
+  -H "Content-Type: application/json" \
+  -d '{
+    "operator": "Admin1",
+    "notes": "Revert due to incorrect approval"
+  }'
+```
+
+响应示例：
+```json
+{
+  "id": 1,
+  "cert_no": "CERT-001",
+  "workflow_status": "reviewed",
+  "approved_by": null,
+  "approved_at": null,
+  "version": 5,
+  ...
+}
+```
+
+#### 撤销限制
+- 只能撤销最近一次工作流变更
+- 已撤销的变更不能再次撤销
+- 撤销会恢复：
+  - 证书工作流状态
+  - 相关人员信息（approved_by, released_by 等）
+  - 设备状态（如果是 release/limit/stop 操作）
+- 撤销操作本身会记录审计日志
+
+#### 重复撤销失败示例
+```bash
+# 第一次撤销成功
+curl -X POST http://localhost:5000/api/certificates/1/revert \
+  -H "Content-Type: application/json" \
+  -d '{"operator": "Admin1", "notes": "First revert"}'
+
+# 第二次撤销失败
+curl -X POST http://localhost:5000/api/certificates/1/revert \
+  -H "Content-Type: application/json" \
+  -d '{"operator": "Admin1", "notes": "Second revert"}'
+
+# 响应：
+{
+  "errors": [
+    {"error": "No workflow change to revert"}
+  ]
+}
+```
+
+#### 撤销草稿状态失败示例
+```bash
+curl -X POST http://localhost:5000/api/certificates/1/revert \
+  -H "Content-Type: application/json" \
+  -d '{"operator": "Admin1", "notes": "Try to revert draft"}'
+
+# 响应：
+{
+  "errors": [
+    {"error": "No workflow change to revert"}
+  ]
+}
+```
+
 ## 错误处理示例
 
 ### 1. 日期倒挂错误
@@ -425,7 +567,7 @@ DRAFT → ENTERED → REVIEWED → APPROVED → RELEASED/LIMITED/STOPPED
 
 - `timestamp`: 操作时间
 - `operator`: 操作者
-- `action`: 操作类型（import, enter, review, approve, release, limit, stop）
+- `action`: 操作类型（import, enter, review, approve, release, limit, stop, revert）
 - `resource_type`: 资源类型（equipment, certificate）
 - `resource_id`: 资源ID
 - `notes`: 备注
@@ -433,6 +575,10 @@ DRAFT → ENTERED → REVIEWED → APPROVED → RELEASED/LIMITED/STOPPED
 - `version`: 版本号
 - `previous_state`: 前一个状态
 - `new_state`: 新状态
+- `reverted`: 是否已被撤销
+- `reverted_by`: 撤销操作人
+- `reverted_at`: 撤销时间
+- `revert_log_id`: 关联的撤销日志ID
 
 ## 目录结构
 
