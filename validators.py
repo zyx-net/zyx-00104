@@ -58,12 +58,6 @@ class CertificateValidator:
             })
 
     def _validate_range(self, data, equipment):
-        if data['range_min'] < 0:
-            self.errors.append({
-                'field': 'range_min',
-                'error': 'Range min must be non-negative'
-            })
-
         if data['range_max'] <= 0:
             self.errors.append({
                 'field': 'range_max',
